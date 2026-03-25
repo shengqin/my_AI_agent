@@ -30,8 +30,8 @@ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Loading modules..."
 
 # Load required tools via Sherlock's module system
 ml biology
-ml gatk
-ml manta
+ml gatk/4.6.0.0
+# Manta is called directly via absolute path below (no module needed)
 
 # ==============================================================================
 # Input Variables (Modify these paths for your specific run)
@@ -42,13 +42,18 @@ SAMPLE_FILE="/path/to/sample_to_barcode.txt"
 # 2. Directory containing cfDNA BAM files
 # We assume the BAMs are named something like: {SAMPLE_NAME}_cfDNA.bam
 # Update the suffix if yours are named exactly the same as the sample, or differently
-CFDNA_DIR="/path/to/cfdna_bam_folder"
-CFDNA_SUFFIX=".bam" # e.g., ".bam", "_cfdna.bam", or "_tumor.bam"
+CFDNA_DIR="/oak/stanford/groups/emoding/sequencing/pipeline/runs/cappseq/BinkleyLab/NovaSeqB25/demultiplexed/barcode-deduped/cfDNA"
+CFDNA_PREFIX="Sample_"
+CFDNA_SUFFIX="-T1_cfDNA.dualindex-deduped.sorted.bam" # e.g., ".bam", "_cfdna.bam", or "_tumor.bam"
 
 # 3. Directory containing matched normal BAM files
-# We assume the BAMs are named something like: {SAMPLE_NAME}_normal.bam
-NORMAL_DIR="/path/to/normal_bam_folder"
-NORMAL_SUFFIX=".bam" # e.g., ".bam", "_normal.bam", or "_pbl.bam"
+# We assume the BAMs are named something like: Sample_{SAMPLE_NAME}-N1_Normal.dualindex-deduped.sorted.bam
+NORMAL_DIR="/oak/stanford/groups/emoding/sequencing/pipeline/runs/cappseq/BinkleyLab/NovaSeqB25/demultiplexed/barcode-deduped/normal"
+NORMAL_PREFIX="Sample_"
+NORMAL_SUFFIX="-N1_Normal.dualindex-deduped.sorted.bam" # Select the specific variant you want to use
+
+# 4. Output Directory for all variant calling results
+OUTPUT_DIR="results_somatic_calling"
 
 # Path to the reference genome FASTA used to align the BAMs
 REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
@@ -75,12 +80,12 @@ fi
 echo "Running somatic calling for sample: $SAMPLE_NAME"
 
 # Build full paths to the matched BAMs
-TUMOR_BAM="${CFDNA_DIR}/${SAMPLE_NAME}${CFDNA_SUFFIX}"
-NORMAL_BAM="${NORMAL_DIR}/${SAMPLE_NAME}${NORMAL_SUFFIX}"
+TUMOR_BAM="${CFDNA_DIR}/${CFDNA_PREFIX}${SAMPLE_NAME}${CFDNA_SUFFIX}"
+NORMAL_BAM="${NORMAL_DIR}/${NORMAL_PREFIX}${SAMPLE_NAME}${NORMAL_SUFFIX}"
 
 # Output workspace directories tailored to this sample
-MANTA_RUNDIR="results/${SAMPLE_NAME}/manta_somatic_run"
-MUTECT_OUTDIR="results/${SAMPLE_NAME}/mutect2_somatic_run"
+MANTA_RUNDIR="${OUTPUT_DIR}/${SAMPLE_NAME}/manta_somatic_run"
+MUTECT_OUTDIR="${OUTPUT_DIR}/${SAMPLE_NAME}/mutect2_somatic_run"
 
 # ==============================================================================
 # Pre-run Checks & Directory Setup
@@ -102,7 +107,7 @@ done
 echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Manta SV Calling for $SAMPLE_NAME..."
 
 # Step 1.1: Configure the Manta workflow for somatic calling.
-configManta.py \
+${HOME}/manta-1.6.0.centos6_x86_64/bin/configManta.py \
     --normalBam "$NORMAL_BAM" \
     --tumorBam "$TUMOR_BAM" \
     --referenceFasta "$REF_GENOME" \
