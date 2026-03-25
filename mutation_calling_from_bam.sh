@@ -1,14 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=somatic_calling
-#SBATCH --output=logs/somatic_calling_%A_%a.log
-#SBATCH --error=logs/somatic_calling_%A_%a.err
-#SBATCH --time=48:00:00
-#SBATCH --partition=normal
-#SBATCH --nodes=1
+#SBATCH --job-name=B25
+#SBATCH --time=5-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --array=1-100 # UPDATE THIS to match the number of lines in your sample file!
+#SBATCH --mem-per-cpu=16G
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=ssu42
+#SBATCH --partition=emoding
 
 # ==============================================================================
 # Somatic Variant Calling Workflow (cfDNA + matched normal)
@@ -53,7 +51,7 @@ NORMAL_DIR="/path/to/normal_bam_folder"
 NORMAL_SUFFIX=".bam" # e.g., ".bam", "_normal.bam", or "_pbl.bam"
 
 # Path to the reference genome FASTA used to align the BAMs
-REF_GENOME="/path/to/reference.fasta"
+REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
 
 # ==============================================================================
 # Sample Selection via SLURM Array
