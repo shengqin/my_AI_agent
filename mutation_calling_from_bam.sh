@@ -34,26 +34,32 @@ ml gatk/4.6.0.0
 # Manta is called directly via absolute path below (no module needed)
 
 # ==============================================================================
-# Input Variables (Modify these paths for your specific run)
+# Input Variables
 # ==============================================================================
-# 1. Path to the sample_to_barcode file (Sample name expected in the 1st column)
-SAMPLE_FILE="/path/to/sample_to_barcode.txt"
+if [[ "$#" -lt 3 ]]; then
+    echo "Usage: sbatch --array=1-N mutation_calling_from_bam.sh <SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR]"
+    echo "Example: sbatch --array=1-5 mutation_calling_from_bam.sh sample2barcodeB23_1.txt /path/to/cfdna /path/to/normal results /path/to/beds"
+    exit 1
+fi
+
+# 1. Path to the sample_to_barcode file (Sample name expected in 1st, Bed in 5th)
+SAMPLE_FILE="$1"
 
 # 2. Directory containing cfDNA BAM files
-# We assume the BAMs are named something like: {SAMPLE_NAME}_cfDNA.bam
-# Update the suffix if yours are named exactly the same as the sample, or differently
-CFDNA_DIR="/oak/stanford/groups/emoding/sequencing/pipeline/runs/cappseq/BinkleyLab/NovaSeqB25/demultiplexed/barcode-deduped/cfDNA"
+CFDNA_DIR="$2"
 CFDNA_PREFIX="Sample_"
-CFDNA_SUFFIX="-T1_cfDNA.dualindex-deduped.sorted.bam" # e.g., ".bam", "_cfdna.bam", or "_tumor.bam"
+CFDNA_SUFFIX=".dualindex-deduped.sorted.bam"
 
 # 3. Directory containing matched normal BAM files
-# We assume the BAMs are named something like: Sample_{SAMPLE_NAME}-N1_Normal.dualindex-deduped.sorted.bam
-NORMAL_DIR="/oak/stanford/groups/emoding/sequencing/pipeline/runs/cappseq/BinkleyLab/NovaSeqB25/demultiplexed/barcode-deduped/normal"
+NORMAL_DIR="$3"
 NORMAL_PREFIX="Sample_"
-NORMAL_SUFFIX="-N1_Normal.dualindex-deduped.sorted.bam" # Select the specific variant you want to use
+NORMAL_SUFFIX=".dualindex-deduped.sorted.bam"
 
 # 4. Output Directory for all variant calling results
-OUTPUT_DIR="results_somatic_calling"
+OUTPUT_DIR="${4:-results_somatic_calling}"
+
+# 5. Directory containing BED files for CNV calling
+BED_DIR="${5:-/oak/stanford/groups/emoding/sequencing/pipeline/selectors}"
 
 # Path to the reference genome FASTA used to align the BAMs
 REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
@@ -71,30 +77,38 @@ fi
 # We read the N-th line of the sample file, where N = SLURM_ARRAY_TASK_ID
 # awk '{print $1}' gets the first column (handling tabs/spaces)
 SAMPLE_NAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $1}' "$SAMPLE_FILE")
+TARGET_BED_BASENAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $5}' "$SAMPLE_FILE")
 
 if [[ -z "$SAMPLE_NAME" ]]; then
     echo "ERROR: Blank sample name retrieved for task ID $SLURM_ARRAY_TASK_ID. Check your sample file."
     exit 1
 fi
 
-echo "Running somatic calling for sample: $SAMPLE_NAME"
+# Convert Tumor sample ID to Normal sample ID (e.g. LP09-T1 -> LP09-N1)
+PATIENT_ID="${SAMPLE_NAME%-T1}"
+NORMAL_NAME="${PATIENT_ID}-N1_Normal"
+TUMOR_NAME="${SAMPLE_NAME}_cfDNA"
+
+echo "Running somatic calling for sample: $SAMPLE_NAME (Matched Normal: $NORMAL_NAME)"
 
 # Build full paths to the matched BAMs
-TUMOR_BAM="${CFDNA_DIR}/${CFDNA_PREFIX}${SAMPLE_NAME}${CFDNA_SUFFIX}"
-NORMAL_BAM="${NORMAL_DIR}/${NORMAL_PREFIX}${SAMPLE_NAME}${NORMAL_SUFFIX}"
+TUMOR_BAM="${CFDNA_DIR}/${CFDNA_PREFIX}${TUMOR_NAME}${CFDNA_SUFFIX}"
+NORMAL_BAM="${NORMAL_DIR}/${NORMAL_PREFIX}${NORMAL_NAME}${NORMAL_SUFFIX}"
+TARGET_BED="${BED_DIR}/${TARGET_BED_BASENAME}"
 
 # Output workspace directories tailored to this sample
 MANTA_RUNDIR="${OUTPUT_DIR}/${SAMPLE_NAME}/manta_somatic_run"
 MUTECT_OUTDIR="${OUTPUT_DIR}/${SAMPLE_NAME}/mutect2_somatic_run"
+CNVKIT_OUTDIR="${OUTPUT_DIR}/${SAMPLE_NAME}/cnvkit_run"
 
 # ==============================================================================
 # Pre-run Checks & Directory Setup
 # ==============================================================================
 # Ensure output directories exist, and create log directory for SLURM logs
-mkdir -p logs "$MANTA_RUNDIR" "$MUTECT_OUTDIR"
+mkdir -p logs "$MANTA_RUNDIR" "$MUTECT_OUTDIR" "$CNVKIT_OUTDIR"
 
 # Verify all input files exist before starting heavy compute
-for FILE in "$TUMOR_BAM" "$NORMAL_BAM" "$REF_GENOME"; do
+for FILE in "$TUMOR_BAM" "$NORMAL_BAM" "$REF_GENOME" "$TARGET_BED"; do
     if [[ ! -f "$FILE" ]]; then
         echo "ERROR: Input file $FILE does not exist!"
         exit 1
@@ -130,9 +144,13 @@ UNFILTERED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_unfiltered.vcf.gz"
 FILTERED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_filtered.vcf.gz"
 
 # NOTE: Mutect2 requires the -normal argument to exactly match the Read Group Sample Name (SM tag) 
-# present in the normal BAM file. If your BAM's SM tag is NOT equal to $SAMPLE_NAME, standard 
-# Mutect2 behavior will fail. You can extract it dynamically if needed:
-# NORMAL_SM=$(samtools view -H "$NORMAL_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+# present in the normal BAM file. We dynamically extract it to prevent crashes.
+NORMAL_SM=$(samtools view -H "$NORMAL_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+
+if [[ -z "$NORMAL_SM" ]]; then
+    echo "WARNING: Could not extract @RG SM tag from normal BAM. Falling back to filename assumption."
+    NORMAL_SM="${NORMAL_NAME}"
+fi
 
 # Step 2.1: Run GATK Mutect2.
 # Extremely important for cfDNA: --minimum-allele-fraction is manually lowered to 0.001 (0.1%).
@@ -140,7 +158,7 @@ gatk Mutect2 \
     -R "$REF_GENOME" \
     -I "$TUMOR_BAM" \
     -I "$NORMAL_BAM" \
-    -normal "$SAMPLE_NAME" \
+    -normal "$NORMAL_SM" \
     -O "$UNFILTERED_VCF" \
     --minimum-allele-fraction 0.001
 
@@ -153,6 +171,26 @@ gatk FilterMutectCalls \
     -O "$FILTERED_VCF"
 
 echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NAME."
+
+# ==============================================================================
+# 3. CNV Calling with CNVkit
+# ==============================================================================
+echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
+
+# Check if CNVkit is available
+if command -v cnvkit.py &> /dev/null; then
+    cnvkit.py batch "$TUMOR_BAM" \
+        --normal "$NORMAL_BAM" \
+        --targets "$TARGET_BED" \
+        --fasta "$REF_GENOME" \
+        --output-dir "$CNVKIT_OUTDIR" \
+        --drop-low-coverage
+else
+    echo "WARNING: cnvkit.py not found in PATH. Skipping CNV calling."
+    # If it fails, ensure CNVkit is properly installed/loaded via module system if needed
+fi
+
+echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit execution logic finished for $SAMPLE_NAME."
 
 # ==============================================================================
 # Pipeline Complete

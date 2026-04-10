@@ -1,0 +1,6 @@
+cfRNA_exp = read.table("/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/CIRCE_Project/data/2025-09-23_cfRNA_coding_symbol_TPM.txt", header = T, row.names=1, sep="\t")
+epic_exp = read.table("/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/02-2023_Collaboration/data/2026-03-10_cHL_epic_linear_mixture.txt", header = T, row.names=1, sep="\t")
+bulk_exp = read.table("/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/Lymphoma/cybersort/data/2025-Q3Q4/2025-07-12_cHL_TPM.txt", header = T, row.names=1, sep="\t")
+print(dim(cfRNA_exp))
+print(dim(epic_exp))
+print(dim(bulk_exp))
