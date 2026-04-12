@@ -3,7 +3,7 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=16G
+#SBATCH --mem-per-cpu=10G
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=ssu42
 #SBATCH --partition=emoding
@@ -36,30 +36,31 @@ ml gatk/4.6.0.0
 # ==============================================================================
 # Input Variables
 # ==============================================================================
-if [[ "$#" -lt 3 ]]; then
-    echo "Usage: sbatch --array=1-N mutation_calling_from_bam.sh <SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR]"
-    echo "Example: sbatch --array=1-5 mutation_calling_from_bam.sh sample2barcodeB23_1.txt /path/to/cfdna /path/to/normal results /path/to/beds"
+if [[ "$#" -lt 4 ]]; then
+    echo "Usage: sbatch --array=1-N mutation_calling_from_bam.sh <CFDNA_SAMPLE_FILE> <NORMAL_SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR]"
+    echo "Example: sbatch --array=1-5 mutation_calling_from_bam.sh sample2barcode_tumor.txt sample2barcode_normal.txt /path/to/cfdna /path/to/normal results /path/to/beds"
     exit 1
 fi
 
-# 1. Path to the sample_to_barcode file (Sample name expected in 1st, Bed in 5th)
-SAMPLE_FILE="$1"
+# 1. Path to the sample_to_barcode files
+CFDNA_SAMPLE_FILE="$1"
+NORMAL_SAMPLE_FILE="$2"
 
 # 2. Directory containing cfDNA BAM files
-CFDNA_DIR="$2"
+CFDNA_DIR="$3"
 CFDNA_PREFIX="Sample_"
-CFDNA_SUFFIX=".dualindex-deduped.sorted.bam"
+CFDNA_SUFFIX="_cfDNA.dualindex-deduped.sorted.bam"
 
 # 3. Directory containing matched normal BAM files
-NORMAL_DIR="$3"
+NORMAL_DIR="$4"
 NORMAL_PREFIX="Sample_"
-NORMAL_SUFFIX=".dualindex-deduped.sorted.bam"
+NORMAL_SUFFIX="_Normal.dualindex-deduped.sorted.bam"
 
 # 4. Output Directory for all variant calling results
-OUTPUT_DIR="${4:-results_somatic_calling}"
+OUTPUT_DIR="${5:-results_somatic_calling}"
 
 # 5. Directory containing BED files for CNV calling
-BED_DIR="${5:-/oak/stanford/groups/emoding/sequencing/pipeline/selectors}"
+BED_DIR="${6:-/oak/stanford/groups/emoding/sequencing/pipeline/selectors}"
 
 # Path to the reference genome FASTA used to align the BAMs
 REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
@@ -74,22 +75,29 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 fi
 
 # Extract the sample name for this specific array task
-# We read the N-th line of the sample file, where N = SLURM_ARRAY_TASK_ID
-# awk '{print $1}' gets the first column (handling tabs/spaces)
-SAMPLE_NAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $1}' "$SAMPLE_FILE")
-TARGET_BED_BASENAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $5}' "$SAMPLE_FILE")
+# We read the N-th line of the cfDNA sample file, where N = SLURM_ARRAY_TASK_ID
+SAMPLE_NAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $1}' "$CFDNA_SAMPLE_FILE")
+TARGET_BED_BASENAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $5}' "$CFDNA_SAMPLE_FILE")
 
 if [[ -z "$SAMPLE_NAME" ]]; then
-    echo "ERROR: Blank sample name retrieved for task ID $SLURM_ARRAY_TASK_ID. Check your sample file."
+    echo "ERROR: Blank sample name retrieved for task ID $SLURM_ARRAY_TASK_ID. Check your cfDNA sample file."
     exit 1
 fi
 
-# Convert Tumor sample ID to Normal sample ID (e.g. LP09-T1 -> LP09-N1)
-PATIENT_ID="${SAMPLE_NAME%-T1}"
-NORMAL_NAME="${PATIENT_ID}-N1_Normal"
-TUMOR_NAME="${SAMPLE_NAME}_cfDNA"
+# Convert Tumor sample ID to Patient ID (e.g. LP09-T1 -> LP09, LP09-T2 -> LP09)
+PATIENT_ID="${SAMPLE_NAME%-T*}"
+TUMOR_NAME="${SAMPLE_NAME}"
 
-echo "Running somatic calling for sample: $SAMPLE_NAME (Matched Normal: $NORMAL_NAME)"
+# Dynamically find the matched normal sample from the Normal Sample File
+# Searches for the PATIENT_ID followed by a dash (e.g. "LP09-")
+NORMAL_NAME=$(awk -v pat="^${PATIENT_ID}-" '$1 ~ pat {print $1; exit}' "$NORMAL_SAMPLE_FILE")
+
+if [[ -z "$NORMAL_NAME" ]]; then
+    echo "ERROR: Could not find a matching Normal sample for patient $PATIENT_ID in $NORMAL_SAMPLE_FILE!"
+    exit 1
+fi
+
+echo "Running somatic calling for patient $PATIENT_ID | Tumor: $TUMOR_NAME | Matched Normal: $NORMAL_NAME"
 
 # Build full paths to the matched BAMs
 TUMOR_BAM="${CFDNA_DIR}/${CFDNA_PREFIX}${TUMOR_NAME}${CFDNA_SUFFIX}"
