@@ -30,6 +30,8 @@ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Loading modules..."
 
 # Load required tools via Sherlock's module system
 ml biology
+ml samtools/1.16.1
+ml python/2.7.13
 ml gatk/4.6.0.0
 # Manta is called directly via absolute path below (no module needed)
 
@@ -76,8 +78,8 @@ fi
 
 # Extract the sample name for this specific array task
 # We read the N-th line of the cfDNA sample file, where N = SLURM_ARRAY_TASK_ID
-SAMPLE_NAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $1}' "$CFDNA_SAMPLE_FILE")
-TARGET_BED_BASENAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {print $5}' "$CFDNA_SAMPLE_FILE")
+SAMPLE_NAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {sub(/\r$/,""); print $1}' "$CFDNA_SAMPLE_FILE")
+TARGET_BED_BASENAME=$(awk -v task_id="$SLURM_ARRAY_TASK_ID" 'NR==task_id {sub(/\r$/,""); print $5}' "$CFDNA_SAMPLE_FILE")
 
 if [[ -z "$SAMPLE_NAME" ]]; then
     echo "ERROR: Blank sample name retrieved for task ID $SLURM_ARRAY_TASK_ID. Check your cfDNA sample file."
@@ -90,7 +92,7 @@ TUMOR_NAME="${SAMPLE_NAME}"
 
 # Dynamically find the matched normal sample from the Normal Sample File
 # Searches for the PATIENT_ID followed by a dash (e.g. "LP09-")
-NORMAL_NAME=$(awk -v pat="^${PATIENT_ID}-" '$1 ~ pat {print $1; exit}' "$NORMAL_SAMPLE_FILE")
+NORMAL_NAME=$(awk -v pat="^${PATIENT_ID}-" '$1 ~ pat {sub(/\r$/,""); print $1; exit}' "$NORMAL_SAMPLE_FILE")
 
 if [[ -z "$NORMAL_NAME" ]]; then
     echo "ERROR: Could not find a matching Normal sample for patient $PATIENT_ID in $NORMAL_SAMPLE_FILE!"
@@ -153,11 +155,37 @@ FILTERED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_filtered.vcf.gz"
 
 # NOTE: Mutect2 requires the -normal argument to exactly match the Read Group Sample Name (SM tag) 
 # present in the normal BAM file. We dynamically extract it to prevent crashes.
+# We temporarily disable pipefail because grep -m1 closes the pipe early,
+# causing samtools to throw a SIGPIPE error (which silently kills the whole script).
+set +o pipefail
 NORMAL_SM=$(samtools view -H "$NORMAL_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+TUMOR_SM=$(samtools view -H "$TUMOR_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+set -o pipefail
 
+# If the normal BAM has no RG, we create a temporary patched BAM
 if [[ -z "$NORMAL_SM" ]]; then
-    echo "WARNING: Could not extract @RG SM tag from normal BAM. Falling back to filename assumption."
+    echo "WARNING: Normal BAM is missing @RG lines. Generating a Read Group BAM on the fly..."
     NORMAL_SM="${NORMAL_NAME}"
+    PATCHED_NORMAL="${MUTECT_OUTDIR}/${NORMAL_NAME}_rg_patched.bam"
+    
+    if [[ ! -f "${PATCHED_NORMAL}.bai" ]]; then
+        samtools addreplacerg -r "@RG\tID:${NORMAL_NAME}\tSM:${NORMAL_NAME}\tLB:Normal\tPL:ILLUMINA" -o "$PATCHED_NORMAL" -@ 4 "$NORMAL_BAM"
+        samtools index -@ 4 "$PATCHED_NORMAL"
+    fi
+    NORMAL_BAM="$PATCHED_NORMAL"
+fi
+
+# If the tumor BAM has no RG, we create a temporary patched BAM
+if [[ -z "$TUMOR_SM" ]]; then
+    echo "WARNING: Tumor BAM is missing @RG lines. Generating a Read Group BAM on the fly..."
+    TUMOR_SM="${SAMPLE_NAME}"
+    PATCHED_TUMOR="${MUTECT_OUTDIR}/${SAMPLE_NAME}_rg_patched.bam"
+    
+    if [[ ! -f "${PATCHED_TUMOR}.bai" ]]; then
+        samtools addreplacerg -r "@RG\tID:${SAMPLE_NAME}\tSM:${SAMPLE_NAME}\tLB:cfDNA\tPL:ILLUMINA" -o "$PATCHED_TUMOR" -@ 4 "$TUMOR_BAM"
+        samtools index -@ 4 "$PATCHED_TUMOR"
+    fi
+    TUMOR_BAM="$PATCHED_TUMOR"
 fi
 
 # Step 2.1: Run GATK Mutect2.
@@ -185,6 +213,11 @@ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NA
 # ==============================================================================
 echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
 
+# Load conda and activate the cnvkit environment
+module load miniconda
+eval "$(conda shell.bash hook)"
+conda activate cnvkit
+
 # Check if CNVkit is available
 if command -v cnvkit.py &> /dev/null; then
     cnvkit.py batch "$TUMOR_BAM" \
@@ -194,9 +227,11 @@ if command -v cnvkit.py &> /dev/null; then
         --output-dir "$CNVKIT_OUTDIR" \
         --drop-low-coverage
 else
-    echo "WARNING: cnvkit.py not found in PATH. Skipping CNV calling."
-    # If it fails, ensure CNVkit is properly installed/loaded via module system if needed
+    echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
 fi
+
+# Deactivate gracefully when done
+conda deactivate
 
 echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit execution logic finished for $SAMPLE_NAME."
 
