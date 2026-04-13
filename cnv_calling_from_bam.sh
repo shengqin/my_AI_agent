@@ -29,9 +29,12 @@ set -euo pipefail
 echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Loading modules..."
 
 # Load miniconda and activate the cnvkit environment
-module load miniconda
-eval "$(conda shell.bash hook)"
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate cnvkit
+
+# Load samtools for potential Read Group patching
+ml biology
+ml samtools/1.16.1
 
 # ==============================================================================
 # Input Variables
@@ -124,19 +127,55 @@ done
 # ==============================================================================
 # 1. CNV Calling with CNVkit
 # ==============================================================================
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
 
-# Check if CNVkit is available
-if command -v cnvkit.py &> /dev/null; then
-    cnvkit.py batch "$TUMOR_BAM" \
-        --normal "$NORMAL_BAM" \
-        --targets "$TARGET_BED" \
-        --fasta "$REF_GENOME" \
-        --output-dir "$CNVKIT_OUTDIR" \
-        --drop-low-coverage
+# Patch BAMs missing @RG Read Groups (required for correct sample identification)
+set +o pipefail
+NORMAL_SM=$(samtools view -H "$NORMAL_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+TUMOR_SM=$(samtools view -H "$TUMOR_BAM" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+set -o pipefail
+
+if [[ -z "$NORMAL_SM" ]]; then
+    echo "WARNING: Normal BAM is missing @RG lines. Generating a Read Group BAM on the fly..."
+    PATCHED_NORMAL="${CNVKIT_OUTDIR}/${NORMAL_NAME}_rg_patched.bam"
+    if [[ ! -f "${PATCHED_NORMAL}.bai" ]]; then
+        samtools addreplacerg -r "@RG\tID:${NORMAL_NAME}\tSM:${NORMAL_NAME}\tLB:Normal\tPL:ILLUMINA" -o "$PATCHED_NORMAL" -@ 4 "$NORMAL_BAM"
+        samtools index -@ 4 "$PATCHED_NORMAL"
+    fi
+    NORMAL_BAM="$PATCHED_NORMAL"
+fi
+
+if [[ -z "$TUMOR_SM" ]]; then
+    echo "WARNING: Tumor BAM is missing @RG lines. Generating a Read Group BAM on the fly..."
+    PATCHED_TUMOR="${CNVKIT_OUTDIR}/${SAMPLE_NAME}_rg_patched.bam"
+    if [[ ! -f "${PATCHED_TUMOR}.bai" ]]; then
+        samtools addreplacerg -r "@RG\tID:${SAMPLE_NAME}\tSM:${SAMPLE_NAME}\tLB:cfDNA\tPL:ILLUMINA" -o "$PATCHED_TUMOR" -@ 4 "$TUMOR_BAM"
+        samtools index -@ 4 "$PATCHED_TUMOR"
+    fi
+    TUMOR_BAM="$PATCHED_TUMOR"
+fi
+
+CNVKIT_CNS=$(find "$CNVKIT_OUTDIR" -name "*.cns" 2>/dev/null | head -n 1)
+
+if [[ -n "$CNVKIT_CNS" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit already completed for $SAMPLE_NAME. Skipping."
 else
-    echo "ERROR: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
-    exit 1
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
+
+    # Check if CNVkit is available
+    if command -v cnvkit.py &> /dev/null; then
+        cnvkit.py batch "$TUMOR_BAM" \
+            --normal "$NORMAL_BAM" \
+            --targets "$TARGET_BED" \
+            --fasta "$REF_GENOME" \
+            --output-dir "$CNVKIT_OUTDIR" \
+            --method amplicon \
+            --drop-low-coverage
+    else
+        echo "ERROR: cnvkit.py not found after attempting to load conda env."
+        exit 1
+    fi
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit Calling Complete for $SAMPLE_NAME."
 fi
 
 # Deactivate gracefully when done

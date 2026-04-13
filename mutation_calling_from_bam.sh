@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=B25
+#SBATCH --job-name=somatic
 #SBATCH --time=7-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -128,28 +128,32 @@ done
 # ==============================================================================
 # 1. Structural Variant (SV) Calling with Manta (Somatic Mode)
 # ==============================================================================
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Manta SV Calling for $SAMPLE_NAME..."
+MANTA_SV_VCF="$MANTA_RUNDIR/results/variants/somaticSV.vcf.gz"
 
-# Step 1.1: Configure the Manta workflow for somatic calling.
-${HOME}/manta-1.6.0.centos6_x86_64/bin/configManta.py \
-    --normalBam "$NORMAL_BAM" \
-    --tumorBam "$TUMOR_BAM" \
-    --referenceFasta "$REF_GENOME" \
-    --runDir "$MANTA_RUNDIR"
+if [[ -f "$MANTA_SV_VCF" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Manta already completed for $SAMPLE_NAME. Skipping."
+else
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Manta SV Calling for $SAMPLE_NAME..."
 
-# Step 1.2: Execute the generated runWorkflow.py script.
-# We run it locally on this job's node, parallelizing across the allocated CPUS.
-"$MANTA_RUNDIR/runWorkflow.py" \
-    -m local \
-    -j "${SLURM_CPUS_PER_TASK:-8}"
+    # Step 1.1: Configure the Manta workflow for somatic calling.
+    ${HOME}/manta-1.6.0.centos6_x86_64/bin/configManta.py \
+        --normalBam "$NORMAL_BAM" \
+        --tumorBam "$TUMOR_BAM" \
+        --referenceFasta "$REF_GENOME" \
+        --runDir "$MANTA_RUNDIR"
 
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Manta SV Calling Complete for $SAMPLE_NAME."
+    # Step 1.2: Execute the generated runWorkflow.py script.
+    # We run it locally on this job's node, parallelizing across the allocated CPUS.
+    "$MANTA_RUNDIR/runWorkflow.py" \
+        -m local \
+        -j "${SLURM_CPUS_PER_TASK:-8}"
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Manta SV Calling Complete for $SAMPLE_NAME."
+fi
 
 # ==============================================================================
 # 2. SNV and Indel Calling with Mutect2
 # ==============================================================================
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Mutect2 SNV/Indel Calling for $SAMPLE_NAME..."
-
 UNFILTERED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_unfiltered.vcf.gz"
 FILTERED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_filtered.vcf.gz"
 
@@ -188,52 +192,64 @@ if [[ -z "$TUMOR_SM" ]]; then
     TUMOR_BAM="$PATCHED_TUMOR"
 fi
 
-# Step 2.1: Run GATK Mutect2.
-# Extremely important for cfDNA: --minimum-allele-fraction is manually lowered to 0.001 (0.1%).
-gatk Mutect2 \
-    -R "$REF_GENOME" \
-    -I "$TUMOR_BAM" \
-    -I "$NORMAL_BAM" \
-    -normal "$NORMAL_SM" \
-    -O "$UNFILTERED_VCF" \
-    --minimum-allele-fraction 0.001
+if [[ -f "$FILTERED_VCF" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 already completed for $SAMPLE_NAME. Skipping."
+else
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Mutect2 SNV/Indel Calling for $SAMPLE_NAME..."
 
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Calling Complete. Starting Filtering..."
+    # Step 2.1: Run GATK Mutect2.
+    # Extremely important for cfDNA: --minimum-allele-fraction is manually lowered to 0.001 (0.1%).
+    gatk Mutect2 \
+        -R "$REF_GENOME" \
+        -I "$TUMOR_BAM" \
+        -I "$NORMAL_BAM" \
+        -normal "$NORMAL_SM" \
+        -O "$UNFILTERED_VCF" \
+        --minimum-allele-fraction 0.001
 
-# Step 2.2: Apply standard somatic filters with FilterMutectCalls.
-gatk FilterMutectCalls \
-    -R "$REF_GENOME" \
-    -V "$UNFILTERED_VCF" \
-    -O "$FILTERED_VCF"
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Calling Complete. Starting Filtering..."
 
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NAME."
+    # Step 2.2: Apply standard somatic filters with FilterMutectCalls.
+    gatk FilterMutectCalls \
+        -R "$REF_GENOME" \
+        -V "$UNFILTERED_VCF" \
+        -O "$FILTERED_VCF"
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NAME."
+fi
 
 # ==============================================================================
 # 3. CNV Calling with CNVkit
 # ==============================================================================
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
+CNVKIT_CNS=$(find "$CNVKIT_OUTDIR" -name "*.cns" 2>/dev/null | head -n 1)
 
-# Load conda and activate the cnvkit environment
-module load miniconda
-eval "$(conda shell.bash hook)"
-conda activate cnvkit
-
-# Check if CNVkit is available
-if command -v cnvkit.py &> /dev/null; then
-    cnvkit.py batch "$TUMOR_BAM" \
-        --normal "$NORMAL_BAM" \
-        --targets "$TARGET_BED" \
-        --fasta "$REF_GENOME" \
-        --output-dir "$CNVKIT_OUTDIR" \
-        --drop-low-coverage
+if [[ -n "$CNVKIT_CNS" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit already completed for $SAMPLE_NAME. Skipping."
 else
-    echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit Calling for $SAMPLE_NAME..."
+
+    # Load conda and activate the cnvkit environment
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate cnvkit
+
+    # Check if CNVkit is available
+    if command -v cnvkit.py &> /dev/null; then
+        cnvkit.py batch "$TUMOR_BAM" \
+            --normal "$NORMAL_BAM" \
+            --targets "$TARGET_BED" \
+            --fasta "$REF_GENOME" \
+            --output-dir "$CNVKIT_OUTDIR" \
+            --method amplicon \
+            --drop-low-coverage
+    else
+        echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
+    fi
+
+    # Deactivate gracefully when done
+    conda deactivate
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit Calling Complete for $SAMPLE_NAME."
 fi
-
-# Deactivate gracefully when done
-conda deactivate
-
-echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit execution logic finished for $SAMPLE_NAME."
 
 # ==============================================================================
 # Pipeline Complete
