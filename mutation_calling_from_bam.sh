@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=somatic
-#SBATCH --time=7-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=10G
+#SBATCH --mem-per-cpu=8G
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=ssu42
 #SBATCH --partition=emoding
@@ -216,6 +216,28 @@ else
         -O "$FILTERED_VCF"
 
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NAME."
+fi
+
+# Step 2.3: Annotate variants with SnpEff (gene names, variant types, protein changes).
+# This produces the annotated VCF needed for OncoPrint / MAF generation.
+ANNOTATED_VCF="$MUTECT_OUTDIR/${SAMPLE_NAME}_mutect2_annotated.vcf.gz"
+
+if [[ -f "$ANNOTATED_VCF" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] SnpEff annotation already completed for $SAMPLE_NAME. Skipping."
+else
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting SnpEff Annotation for $SAMPLE_NAME..."
+
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate snpeff
+
+    # SnpEff annotates every variant with gene, effect, and protein change.
+    # -noStats suppresses HTML report; -canon uses canonical transcripts only.
+    snpEff ann -noStats -canon hg19 "$FILTERED_VCF" | bgzip > "$ANNOTATED_VCF"
+    tabix -p vcf "$ANNOTATED_VCF"
+
+    conda deactivate
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] SnpEff Annotation Complete for $SAMPLE_NAME."
 fi
 
 # ==============================================================================
