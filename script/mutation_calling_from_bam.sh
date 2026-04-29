@@ -39,8 +39,8 @@ ml gatk/4.6.0.0
 # Input Variables
 # ==============================================================================
 if [[ "$#" -lt 4 ]]; then
-    echo "Usage: sbatch --array=1-N mutation_calling_from_bam.sh <CFDNA_SAMPLE_FILE> <NORMAL_SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR]"
-    echo "Example: sbatch --array=1-5 mutation_calling_from_bam.sh sample2barcode_tumor.txt sample2barcode_normal.txt /path/to/cfdna /path/to/normal results /path/to/beds"
+    echo "Usage: sbatch --array=1-N mutation_calling_from_bam.sh <CFDNA_SAMPLE_FILE> <NORMAL_SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR] [POOLED_REF] [MUTECT2_PON]"
+    echo "Example: sbatch --array=1-5 mutation_calling_from_bam.sh sample2barcode_tumor.txt sample2barcode_normal.txt /path/to/cfdna /path/to/normal results /path/to/beds pooled_reference.cnn mutect2_pon/pon.vcf.gz"
     exit 1
 fi
 
@@ -63,6 +63,16 @@ OUTPUT_DIR="${5:-results_somatic_calling}"
 
 # 5. Directory containing BED files for CNV calling
 BED_DIR="${6:-/oak/stanford/groups/emoding/sequencing/pipeline/selectors}"
+
+# 6. Optional: Pre-built pooled normal reference for CNVkit (from build_cnvkit_reference.sh)
+#    If provided, CNVkit uses this pooled reference instead of the single matched normal.
+#    Build it first:  sbatch build_cnvkit_reference.sh <NORMAL_SAMPLE_FILE> <NORMAL_DIR> <TARGET_BED>
+POOLED_REF="${7:-}"
+
+# 7. Optional: Mutect2 Panel of Normals VCF (from build_mutect2_pon.sh)
+#    Suppresses systematic artifacts and recurrent germline variants during calling.
+#    Build it first:  sbatch build_mutect2_pon.sh <NORMAL_SAMPLE_FILE> <NORMAL_DIR> <TARGET_BED>
+MUTECT2_PON="${8:-}"
 
 # Path to the reference genome FASTA used to align the BAMs
 REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
@@ -199,13 +209,21 @@ else
 
     # Step 2.1: Run GATK Mutect2.
     # Extremely important for cfDNA: --minimum-allele-fraction is manually lowered to 0.001 (0.1%).
+    # If a Panel of Normals is available, it suppresses systematic sequencing artifacts.
+    PON_ARGS=""
+    if [[ -n "$MUTECT2_PON" && -f "$MUTECT2_PON" ]]; then
+        echo "  Using Panel of Normals: $MUTECT2_PON"
+        PON_ARGS="--panel-of-normals $MUTECT2_PON"
+    fi
+
     gatk Mutect2 \
         -R "$REF_GENOME" \
         -I "$TUMOR_BAM" \
         -I "$NORMAL_BAM" \
         -normal "$NORMAL_SM" \
         -O "$UNFILTERED_VCF" \
-        --minimum-allele-fraction 0.001
+        --minimum-allele-fraction 0.001 \
+        $PON_ARGS
 
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Calling Complete. Starting Filtering..."
 
@@ -256,13 +274,25 @@ else
 
     # Check if CNVkit is available
     if command -v cnvkit.py &> /dev/null; then
-        cnvkit.py batch "$TUMOR_BAM" \
-            --normal "$NORMAL_BAM" \
-            --targets "$TARGET_BED" \
-            --fasta "$REF_GENOME" \
-            --output-dir "$CNVKIT_OUTDIR" \
-            --method amplicon \
-            --drop-low-coverage
+        if [[ -n "$POOLED_REF" && -f "$POOLED_REF" ]]; then
+            # Pooled normal reference provided (from build_cnvkit_reference.sh).
+            # Uses the cohort-averaged normal baseline for more stable CNV calls.
+            echo "  Using pooled normal reference: $POOLED_REF"
+            cnvkit.py batch "$TUMOR_BAM" \
+                --reference "$POOLED_REF" \
+                --output-dir "$CNVKIT_OUTDIR" \
+                --drop-low-coverage
+        else
+            # Fallback: single matched normal (no pooled reference available).
+            echo "  Using single matched normal: $NORMAL_BAM"
+            cnvkit.py batch "$TUMOR_BAM" \
+                --normal "$NORMAL_BAM" \
+                --targets "$TARGET_BED" \
+                --fasta "$REF_GENOME" \
+                --output-dir "$CNVKIT_OUTDIR" \
+                --method hybrid \
+                --drop-low-coverage
+        fi
     else
         echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
     fi
@@ -271,6 +301,37 @@ else
     conda deactivate
 
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit Calling Complete for $SAMPLE_NAME."
+fi
+
+# Step 3.1: Generate gene-level copy number metrics for OncoPrint.
+CNVKIT_CNR=$(find "$CNVKIT_OUTDIR" -name "*.cnr" 2>/dev/null | head -n 1)
+CNVKIT_CNS=$(find "$CNVKIT_OUTDIR" -name "*.call.cns" 2>/dev/null | head -n 1)
+GENEMETRICS_TSV="$CNVKIT_OUTDIR/${SAMPLE_NAME}_genemetrics.tsv"
+
+if [[ -f "$GENEMETRICS_TSV" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit genemetrics already completed for $SAMPLE_NAME. Skipping."
+elif [[ -f "$CNVKIT_CNR" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit genemetrics for $SAMPLE_NAME..."
+
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate cnvkit
+
+    if command -v cnvkit.py &> /dev/null; then
+        # genemetrics maps segment-level CN ratios to individual genes.
+        # -t 0.2 = log2 threshold for calling gain/loss at gene level.
+        # -m 3  = minimum number of probes covering a gene to report it.
+        if [[ -f "$CNVKIT_CNS" ]]; then
+            cnvkit.py genemetrics "$CNVKIT_CNR" -s "$CNVKIT_CNS" -t 0.2 -m 3 > "$GENEMETRICS_TSV"
+        else
+            cnvkit.py genemetrics "$CNVKIT_CNR" -t 0.2 -m 3 > "$GENEMETRICS_TSV"
+        fi
+    else
+        echo "WARNING: cnvkit.py not found. Skipping genemetrics."
+    fi
+
+    conda deactivate
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] CNVkit genemetrics Complete for $SAMPLE_NAME."
 fi
 
 # ==============================================================================

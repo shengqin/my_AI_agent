@@ -13,21 +13,22 @@ suppressPackageStartupMessages({
 })
 
 # Define paths (absolute to avoid working directory issues)
-SCRIPT_DIR <- "/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/my_AI_agent"
-RESULTS_DIR <- file.path(SCRIPT_DIR, "combined_summary")
+PROJECT_DIR <- "/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/my_AI_agent"
+DATA_DIR <- file.path(PROJECT_DIR, "data")
+RESULTS_DIR <- file.path(DATA_DIR, "combined_summary")
 MUTECT_FILE <- file.path(RESULTS_DIR, "mutect2_variants.tsv")
 CNVKIT_FILE <- file.path(RESULTS_DIR, "cnvkit_aberrations.tsv")
 CNV_GENE_FILE <- file.path(RESULTS_DIR, "cnvkit_gene_cnvs.tsv")
 SV_FILE <- file.path(RESULTS_DIR, "manta_somatic_svs.tsv")
-OUTPUT_PDF <- file.path(SCRIPT_DIR, "cohort_oncoprint.pdf")
+OUTPUT_PDF <- file.path(PROJECT_DIR, "analysis", "cohort_oncoprint.pdf")
 
 # PoN frequency summary from build_mutect2_pon.sh (set to NA to skip PoN filtering)
-PON_SUMMARY_FILE <- file.path(SCRIPT_DIR, "mutect2_pon", "pon_site_summary.tsv")
+PON_SUMMARY_FILE <- file.path(DATA_DIR, "mutect2_pon", "pon_site_summary.tsv")
 
 # COSMIC coding mutations VCF for rescue logic (set to NA to skip COSMIC rescue)
 # Download from: https://cancer.sanger.ac.uk/cosmic/download (requires free registration)
 # Example: CosmicCodingMuts.vcf.gz (hg19/GRCh37)
-COSMIC_VCF <- file.path(SCRIPT_DIR, "Cosmic_CompleteTargetedScreensMutant_v103_GRCh37.vcf.gz")
+COSMIC_VCF <- file.path(DATA_DIR, "Cosmic_CompleteTargetedScreensMutant_v103_GRCh37.vcf.gz")
 
 cat("Loading and processing variant data...\n")
 
@@ -77,10 +78,8 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
   snv_filt <- snv_filt %>%
     left_join(
       pon_data,
-      by = c(
-        "Chromosome" = "Chromosome", "Position" = "Position",
-        "Ref" = "Ref", "Alt" = "Alt"
-      )
+      by = c("Chromosome" = "Chromosome", "Position" = "Position",
+             "Ref" = "Ref", "Alt" = "Alt")
     ) %>%
     # Fill NA = variant not seen in any PoN sample (clean)
     mutate(
@@ -92,7 +91,7 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
 
   # Tag variants that will be rescued by COSMIC (applied after PoN filter)
   snv_filt <- snv_filt %>%
-    mutate(PON_rescue_eligible = FALSE) # Will be updated by COSMIC rescue below
+    mutate(PON_rescue_eligible = FALSE)  # Will be updated by COSMIC rescue below
 
   # Apply PoN frequency filter:
   # Keep if: not in PoN, or in < 10% of PoN, or in < 30% with tumor >> PoN
@@ -100,10 +99,10 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
     filter(
       # Not in PoN at all — automatically passes
       Fraction_PON_Samples == 0 |
-        # In < 10% of PoN samples
-        Fraction_PON_Samples < 0.10 |
-        # In < 30% of PoN samples AND tumor VAF > 20× max PoN VAF
-        (Fraction_PON_Samples < 0.30 & Tumor_AF_num > (20 * Max_PON_AF))
+      # In < 10% of PoN samples
+      Fraction_PON_Samples < 0.10 |
+      # In < 30% of PoN samples AND tumor VAF > 20× max PoN VAF
+      (Fraction_PON_Samples < 0.30 & Tumor_AF_num > (20 * Max_PON_AF))
     )
 
   # When variant IS seen in any PoN sample, apply stricter normal VAF threshold
@@ -112,14 +111,12 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
   snv_filt <- snv_filt %>%
     filter(
       !In_PON |
-        (Normal_AF_num < 0.001) |
-        (Tumor_AF_num > 20 * pmax(Normal_AF_num, Max_PON_AF))
+      (Normal_AF_num < 0.001) |
+      (Tumor_AF_num > 20 * pmax(Normal_AF_num, Max_PON_AF))
     )
 
-  cat(sprintf(
-    "  PoN filter: %d -> %d variants (%d removed)\n",
-    n_before_pon, nrow(snv_filt), n_before_pon - nrow(snv_filt)
-  ))
+  cat(sprintf("  PoN filter: %d -> %d variants (%d removed)\n",
+              n_before_pon, nrow(snv_filt), n_before_pon - nrow(snv_filt)))
 } else {
   cat("  PoN summary not found — skipping PoN frequency filter.\n")
   cat("  To enable: run build_mutect2_pon.sh and set PON_SUMMARY_FILE path above.\n")
@@ -141,8 +138,7 @@ if (!is.na(COSMIC_VCF) && file.exists(COSMIC_VCF)) {
 
   if (length(cosmic_lines) > 0) {
     cosmic_df <- read_tsv(
-      I(cosmic_lines),
-      col_names = FALSE, show_col_types = FALSE,
+      I(cosmic_lines), col_names = FALSE, show_col_types = FALSE,
       col_select = c(1, 2, 3, 4, 5)
     ) %>%
       rename(Chromosome = X1, Position = X2, COSMIC_ID = X3, Ref = X4, Alt = X5) %>%
@@ -239,7 +235,7 @@ cat(sprintf("  Built gene coordinate lookup: %d genes\n", nrow(gene_coords)))
 cnv_seg_mapped <- tibble(Sample = character(), Gene = character(), Mutation_Class = character())
 
 # Load cytoband data to name large regional CNVs
-cytoband_file <- file.path(SCRIPT_DIR, "cytoBand_hg19.txt")
+cytoband_file <- file.path(DATA_DIR, "cytoBand_hg19.txt")
 cytobands <- NULL
 if (file.exists(cytoband_file)) {
   cytobands <- read_tsv(cytoband_file, col_names = c("chrom", "start", "end", "name", "gieStain"), show_col_types = FALSE)
@@ -599,7 +595,7 @@ cat(sprintf("\nOncoPrint generated successfully: %s\n", OUTPUT_PDF))
 # ==============================================================================
 cat("Generating sequencing depth QC plots...\n")
 
-QC_PDF <- file.path(SCRIPT_DIR, "sequencing_depth_qc.pdf")
+QC_PDF <- file.path(PROJECT_DIR, "analysis", "sequencing_depth_qc.pdf")
 
 # Parse numeric depths from raw data (all variants, not just PASS)
 depth_data <- snv_data %>%

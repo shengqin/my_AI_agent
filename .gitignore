@@ -1,3 +1,30 @@
+# Results and data (large files, generated outputs)
 example_results/
 combined_summary/
 example_summary/
+
+# COSMIC VCF (licensed data, too large for git)
+data/Cosmic_*.vcf.gz
+data/README_Cosmic_*.txt
+
+# SLURM logs
+slurm-*.out
+
+# R temp files
+Rplots.pdf
+*.Rhistory
+
+# Analysis outputs (PDFs, PNGs)
+analysis/*.pdf
+analysis/*.png
+
+# Binary/sample data files
+*.bam
+*.bai
+*.cns
+*.cnr
+*.cnn
+
+# macOS
+.DS_Store
+.agent/

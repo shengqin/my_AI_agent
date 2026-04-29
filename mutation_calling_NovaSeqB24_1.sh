@@ -2,10 +2,10 @@
 # Usage: sbatch --array=1-N mutation_calling_from_bam.sh <CFDNA_SAMPLE_FILE> <NORMAL_SAMPLE_FILE> <CFDNA_DIR> <NORMAL_DIR> [OUTPUT_DIR] [BED_DIR]
 sbatch \
     --job-name=B24_1 \
-    --time=2-00:00:00 \
+    --time=1-00:00:00 \
     --ntasks=1 \
-    --cpus-per-task=8 \
-    --mem-per-cpu=8G \
+    --cpus-per-task=6 \
+    --mem-per-cpu=6G \
     --mail-type=ALL \
     --mail-user=ssu42 \
     --partition=emoding \

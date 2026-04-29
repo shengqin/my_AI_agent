@@ -18,6 +18,7 @@
 #   2. mutect2_variants.tsv             — All variants with gene, effect, VAF
 #   3. cnvkit_aberrations.tsv           — Significant CNV segments
 #   4. manta_somatic_svs.tsv           — All somatic structural variants
+#   5. cnvkit_gene_cnvs.tsv            — Gene-level copy number calls
 # ==============================================================================
 
 set -eu
@@ -55,6 +56,7 @@ SUMMARY_CSV="$OUTPUT_DIR/cohort_variant_summary.csv"
 MUTECT_DETAILS="$OUTPUT_DIR/mutect2_variants.tsv"
 CNV_DETAILS="$OUTPUT_DIR/cnvkit_aberrations.tsv"
 SV_DETAILS="$OUTPUT_DIR/manta_somatic_svs.tsv"
+CNV_GENE_DETAILS="$OUTPUT_DIR/cnvkit_gene_cnvs.tsv"
 
 echo "============================================="
 echo "  Somatic Variant Calling Summary Generator"
@@ -74,6 +76,8 @@ echo -e "Sample\tBatch\tChromosome\tPosition\tRef\tAlt\tFilter\tGene\tVariant_Ty
 echo -e "Sample\tBatch\tChromosome\tStart\tEnd\tLog2_Ratio\tCopy_Number\tDepth\tP_Value\tProbes\tCall_Type" > "$CNV_DETAILS"
 
 echo -e "Sample\tBatch\tChromosome\tPosition\tSV_Type\tFilter\tQual\tMate_Chrom\tMate_Pos" > "$SV_DETAILS"
+
+echo -e "Sample\tBatch\tGene\tChromosome\tStart\tEnd\tLog2_Ratio\tDepth\tWeight\tProbes\tSegment_Log2\tSegment_Probes\tCall_Type" > "$CNV_GENE_DETAILS"
 
 # ---- Process each results directory ----
 SAMPLE_COUNT=0
@@ -197,6 +201,22 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     fi
 
     # ================================================================
+    # 4. CNVKIT GENEMETRICS — Parse gene-level copy number calls
+    # ================================================================
+    GENEMETRICS_FILE=$(find "$SAMPLE_DIR/cnvkit_run" -name "*_genemetrics.tsv" 2>/dev/null | head -n 1)
+
+    if [[ -f "$GENEMETRICS_FILE" ]]; then
+        # genemetrics output columns: chromosome, start, end, gene, log2, depth, weight, probes, segment_log2, segment_probes
+        # Filter to genes with abs(log2) > 0.2 (gain/loss threshold)
+        awk -F'\t' -v sample="$SAMPLE_NAME" -v batch="$BATCH_NAME" 'NR>1 && ($5 > 0.2 || $5 < -0.2) {
+            call_type = "Neutral";
+            if ($5 > 0.2) call_type = "Amplification";
+            else if ($5 < -0.2) call_type = "Deletion";
+            print sample"\t"batch"\t"$4"\t"$1"\t"$2"\t"$3"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"call_type
+        }' "$GENEMETRICS_FILE" >> "$CNV_GENE_DETAILS"
+    fi
+
+    # ================================================================
     # Check pipeline completion
     # ================================================================
     if $MANTA_OK && $MUTECT_OK && $CNVKIT_OK; then
@@ -224,4 +244,5 @@ echo "    1. $SUMMARY_CSV"
 echo "    2. $MUTECT_DETAILS"
 echo "    3. $CNV_DETAILS"
 echo "    4. $SV_DETAILS"
+echo "    5. $CNV_GENE_DETAILS"
 echo "============================================="
