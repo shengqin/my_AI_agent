@@ -62,6 +62,28 @@ snv_filt <- snv_filt %>%
       (Normal_AF_num < 0.01 & Tumor_AF_num > (20 * Normal_AF_num))
   )
 
+# QC Filter 2.5: Indel-specific Strand Bias Filter
+# CAPP-Seq requires indels to have read support from both forward and reverse orientations
+# to eliminate PCR and sequencing artifacts (especially at <1% VAF)
+# Backward compatible: only applies if F1R2/F2R1 columns exist in the data.
+has_strand_cols <- all(c("Tumor_F1R2", "Tumor_F2R1") %in% colnames(snv_filt))
+
+if (has_strand_cols) {
+  snv_filt <- snv_filt %>%
+    mutate(
+      F1R2_Alt = as.numeric(sapply(strsplit(as.character(Tumor_F1R2), ","), function(x) if(length(x)>1) x[2] else "0")),
+      F2R1_Alt = as.numeric(sapply(strsplit(as.character(Tumor_F2R1), ","), function(x) if(length(x)>1) x[2] else "0")),
+      Is_Indel = (nchar(Ref) != nchar(Alt)) | nchar(Ref) > 1 | nchar(Alt) > 1
+    ) %>%
+    filter(
+      # If it's not an indel, keep it. If it is an indel, require both strands > 0
+      !Is_Indel | (F1R2_Alt > 0 & F2R1_Alt > 0)
+    )
+  cat("  Indel strand bias filter: applied (F1R2/F2R1 columns present)\n")
+} else {
+  cat("  Indel strand bias filter: SKIPPED (F1R2/F2R1 columns not found — re-run pipeline with orientation model)\n")
+}
+
 # QC Filter 2b: PoN Frequency Filter (per published CAPP-Seq heuristics)
 # Variant must have read support >= 0.1% VAF in:
 #   (1) < 10% of PoN samples, OR
@@ -89,9 +111,8 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
       In_PON = N_PON_Samples > 0
     )
 
-  # Tag variants that will be rescued by COSMIC (applied after PoN filter)
-  snv_filt <- snv_filt %>%
-    mutate(PON_rescue_eligible = FALSE)  # Will be updated by COSMIC rescue below
+  # Save the FULL set before PoN filtering — needed for COSMIC rescue below
+  snv_pre_pon <- snv_filt
 
   # Apply PoN frequency filter:
   # Keep if: not in PoN, or in < 10% of PoN, or in < 30% with tumor >> PoN
@@ -108,27 +129,32 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
   # When variant IS seen in any PoN sample, apply stricter normal VAF threshold
   # Normal VAF must be < 0.1% (instead of 0.25%),
   # UNLESS tumor VAF > 20× max(normal VAF, max PoN VAF)
+  #   AND read support in < 30% of PoN samples (per paper's additional constraint)
   snv_filt <- snv_filt %>%
     filter(
       !In_PON |
       (Normal_AF_num < 0.001) |
-      (Tumor_AF_num > 20 * pmax(Normal_AF_num, Max_PON_AF))
+      (Tumor_AF_num > 20 * pmax(Normal_AF_num, Max_PON_AF) &
+         Fraction_PON_Samples < 0.30)
     )
 
+  n_pon_removed <- n_before_pon - nrow(snv_filt)
   cat(sprintf("  PoN filter: %d -> %d variants (%d removed)\n",
-              n_before_pon, nrow(snv_filt), n_before_pon - nrow(snv_filt)))
+              n_before_pon, nrow(snv_filt), n_pon_removed))
 } else {
   cat("  PoN summary not found — skipping PoN frequency filter.\n")
   cat("  To enable: run build_mutect2_pon.sh and set PON_SUMMARY_FILE path above.\n")
   snv_filt <- snv_filt %>%
     mutate(In_PON = FALSE, Max_PON_AF = 0, Fraction_PON_Samples = 0)
+  snv_pre_pon <- snv_filt  # No PoN filter applied, so pre = post
 }
 
 # QC Filter 2c: COSMIC Rescue
-# COSMIC-annotated variants with tumor VAF > 20× normal VAF are rescued
-# from PoN filtering (re-added if they were removed above).
-# This prevents filtering out known oncogenic hotspot mutations that happen
-# to also appear at low levels in normal samples.
+# Per the paper: "COSMIC-annotated variants with sample VAF > 20-fold normal
+# VAF were rescued from PON filtering steps."
+# This re-adds PoN-filtered variants that are known oncogenic hotspots,
+# preventing the loss of true somatic mutations that happen to appear
+# at low levels in normal/PoN samples.
 if (!is.na(COSMIC_VCF) && file.exists(COSMIC_VCF)) {
   cat("  Loading COSMIC annotations for rescue logic...\n")
 
@@ -145,28 +171,67 @@ if (!is.na(COSMIC_VCF) && file.exists(COSMIC_VCF)) {
       mutate(Position = as.numeric(Position)) %>%
       distinct(Chromosome, Position, Ref, Alt, .keep_all = TRUE)
 
-    # Check which current variants are in COSMIC
+    # --- Step 1: Tag surviving variants with COSMIC status ---
     snv_filt <- snv_filt %>%
       left_join(
         cosmic_df %>% select(Chromosome, Position, Ref, Alt, COSMIC_ID),
         by = c("Chromosome", "Position", "Ref", "Alt")
       ) %>%
-      mutate(Is_COSMIC = !is.na(COSMIC_ID))
+      mutate(Is_COSMIC = !is.na(COSMIC_ID), COSMIC_Rescued = FALSE)
+
+    # --- Step 2: Identify PoN-removed variants eligible for COSMIC rescue ---
+    # These are variants that were in snv_pre_pon but NOT in snv_filt
+    snv_pon_removed <- snv_pre_pon %>%
+      anti_join(snv_filt, by = c("Chromosome", "Position", "Ref", "Alt", "Sample"))
+
+    if (nrow(snv_pon_removed) > 0) {
+      # Annotate removed variants with COSMIC
+      snv_pon_removed <- snv_pon_removed %>%
+        left_join(
+          cosmic_df %>% select(Chromosome, Position, Ref, Alt, COSMIC_ID),
+          by = c("Chromosome", "Position", "Ref", "Alt")
+        ) %>%
+        mutate(Is_COSMIC = !is.na(COSMIC_ID))
+
+      # Rescue condition: COSMIC-annotated AND tumor VAF > 20× normal VAF
+      rescued <- snv_pon_removed %>%
+        filter(
+          Is_COSMIC,
+          Tumor_AF_num > (20 * Normal_AF_num)
+        ) %>%
+        mutate(COSMIC_Rescued = TRUE)
+
+      n_rescued <- nrow(rescued)
+
+      if (n_rescued > 0) {
+        # Add rescued variants back to the filtered set
+        snv_filt <- bind_rows(snv_filt, rescued)
+        cat(sprintf("  COSMIC rescue: %d variants rescued from PoN filter\n", n_rescued))
+        if (n_rescued <= 20) {
+          cat("  Rescued variants:\n")
+          rescued %>%
+            select(Sample, Gene, Chromosome, Position, Ref, Alt,
+                   Tumor_AF_num, Normal_AF_num, COSMIC_ID) %>%
+            print(n = Inf)
+        }
+      } else {
+        cat("  COSMIC rescue: 0 variants eligible for rescue\n")
+      }
+    } else {
+      cat("  COSMIC rescue: no variants were removed by PoN filter\n")
+    }
 
     n_cosmic <- sum(snv_filt$Is_COSMIC)
-    cat(sprintf("  COSMIC variants in current set: %d\n", n_cosmic))
-
-    # Note: True rescue would re-add PoN-filtered COSMIC variants.
-    # Since we applied PoN filter above, we'd need to re-check the pre-filter set.
-    # For a complete implementation, save the PoN-removed set and rescue here.
-    # Current implementation: COSMIC variants that survived PoN filter are tagged.
+    cat(sprintf("  COSMIC variants in final set: %d\n", n_cosmic))
   } else {
-    snv_filt <- snv_filt %>% mutate(Is_COSMIC = FALSE, COSMIC_ID = NA_character_)
+    snv_filt <- snv_filt %>%
+      mutate(Is_COSMIC = FALSE, COSMIC_ID = NA_character_, COSMIC_Rescued = FALSE)
   }
 } else {
   cat("  COSMIC VCF not configured — skipping COSMIC rescue.\n")
   cat("  To enable: download CosmicCodingMuts.vcf.gz and set COSMIC_VCF path above.\n")
-  snv_filt <- snv_filt %>% mutate(Is_COSMIC = FALSE, COSMIC_ID = NA_character_)
+  snv_filt <- snv_filt %>%
+    mutate(Is_COSMIC = FALSE, COSMIC_ID = NA_character_, COSMIC_Rescued = FALSE)
 }
 
 # QC Filter 3: Remove synonymous/silent or unannotated variants

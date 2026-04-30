@@ -202,13 +202,18 @@ if [[ -z "$TUMOR_SM" ]]; then
     TUMOR_BAM="$PATCHED_TUMOR"
 fi
 
-if [[ -f "$FILTERED_VCF" ]]; then
-    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 already completed for $SAMPLE_NAME. Skipping."
+# Skip guard: require BOTH filtered VCF AND orientation model to exist.
+# If either is missing (e.g., old run without orientation model), re-run everything.
+OB_MODEL="$MUTECT_OUTDIR/${SAMPLE_NAME}_read-orientation-model.tar.gz"
+
+if [[ -f "$FILTERED_VCF" && -f "$OB_MODEL" ]]; then
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 already completed (with orientation model) for $SAMPLE_NAME. Skipping."
 else
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Mutect2 SNV/Indel Calling for $SAMPLE_NAME..."
 
     # Step 2.1: Run GATK Mutect2.
     # Extremely important for cfDNA: --minimum-allele-fraction is manually lowered to 0.001 (0.1%).
+    # -L restricts calling to BLYMv2 panel targets (matches PoN intervals).
     # If a Panel of Normals is available, it suppresses systematic sequencing artifacts.
     PON_ARGS=""
     if [[ -n "$MUTECT2_PON" && -f "$MUTECT2_PON" ]]; then
@@ -221,16 +226,26 @@ else
         -I "$TUMOR_BAM" \
         -I "$NORMAL_BAM" \
         -normal "$NORMAL_SM" \
+        -L "$TARGET_BED" \
         -O "$UNFILTERED_VCF" \
         --minimum-allele-fraction 0.001 \
+        --f1r2-tar-gz "$MUTECT_OUTDIR/${SAMPLE_NAME}_f1r2.tar.gz" \
         $PON_ARGS
 
-    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Calling Complete. Starting Filtering..."
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Calling Complete. Starting LearnReadOrientationModel..."
+
+    # Step 2.1b: Learn Read Orientation Model for oxoG artifacts
+    gatk LearnReadOrientationModel \
+        -I "$MUTECT_OUTDIR/${SAMPLE_NAME}_f1r2.tar.gz" \
+        -O "$MUTECT_OUTDIR/${SAMPLE_NAME}_read-orientation-model.tar.gz"
+
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting Filtering..."
 
     # Step 2.2: Apply standard somatic filters with FilterMutectCalls.
     gatk FilterMutectCalls \
         -R "$REF_GENOME" \
         -V "$UNFILTERED_VCF" \
+        --ob-priors "$MUTECT_OUTDIR/${SAMPLE_NAME}_read-orientation-model.tar.gz" \
         -O "$FILTERED_VCF"
 
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Mutect2 Filtering Complete for $SAMPLE_NAME."
@@ -293,6 +308,22 @@ else
                 --method hybrid \
                 --drop-low-coverage
         fi
+
+        # Step 3.0b: Generate integer copy number calls and statistical p-values.
+        # cnvkit.py batch produces .cns (segments) and .cnr (bin ratios), but NOT .call.cns.
+        # We must explicitly run 'call' to get integer CN, then 'bintest' for p-values.
+        echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit call + bintest..."
+        TMP_CNR=$(find "$CNVKIT_OUTDIR" -name "*.cnr" 2>/dev/null | head -n 1)
+        TMP_CNS=$(find "$CNVKIT_OUTDIR" -name "*.cns" ! -name "*.call.cns" ! -name "*.bintest.cns" 2>/dev/null | head -n 1)
+        if [[ -n "$TMP_CNR" && -n "$TMP_CNS" ]]; then
+            # Step 3.0b-i: Integer copy number calling
+            CALL_OUT="${TMP_CNS%.cns}.call.cns"
+            cnvkit.py call "$TMP_CNS" -o "$CALL_OUT"
+
+            # Step 3.0b-ii: Binomial test for segment-level p-values
+            BINTEST_OUT="${TMP_CNS%.cns}.bintest.cns"
+            cnvkit.py bintest "$TMP_CNR" -s "$CALL_OUT" -t 0.05 > "$BINTEST_OUT"
+        fi
     else
         echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
     fi
@@ -318,12 +349,12 @@ elif [[ -f "$CNVKIT_CNR" ]]; then
 
     if command -v cnvkit.py &> /dev/null; then
         # genemetrics maps segment-level CN ratios to individual genes.
-        # -t 0.2 = log2 threshold for calling gain/loss at gene level.
+        # -t 0.1 = log2 threshold for calling gain/loss at gene level (lowered for cfDNA).
         # -m 3  = minimum number of probes covering a gene to report it.
         if [[ -f "$CNVKIT_CNS" ]]; then
-            cnvkit.py genemetrics "$CNVKIT_CNR" -s "$CNVKIT_CNS" -t 0.2 -m 3 > "$GENEMETRICS_TSV"
+            cnvkit.py genemetrics "$CNVKIT_CNR" -s "$CNVKIT_CNS" -t 0.1 -m 3 > "$GENEMETRICS_TSV"
         else
-            cnvkit.py genemetrics "$CNVKIT_CNR" -t 0.2 -m 3 > "$GENEMETRICS_TSV"
+            cnvkit.py genemetrics "$CNVKIT_CNR" -t 0.1 -m 3 > "$GENEMETRICS_TSV"
         fi
     else
         echo "WARNING: cnvkit.py not found. Skipping genemetrics."
