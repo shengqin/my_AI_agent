@@ -91,8 +91,8 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
 done
 
 # Rename shared reference/summary directories
-rename_if_exists "$CNVKIT_REF_DIR"
-rename_if_exists "$MUTECT2_PON_DIR"
+# rename_if_exists "$CNVKIT_REF_DIR"
+# rename_if_exists "$MUTECT2_PON_DIR"
 rename_if_exists "$SUMMARY_DIR"
 
 echo ""
@@ -102,46 +102,46 @@ echo ""
 # ==============================================================================
 echo "[Step 1] Submitting CNVkit pooled reference build..."
 
-CNVKIT_JOB=$(sbatch \
-    --job-name=cnvkit_ref \
-    --time=1-00:00:00 \
-    --ntasks=1 \
-    --cpus-per-task=8 \
-    --mem-per-cpu=8G \
-    --mail-type=ALL \
-    --mail-user=${SLURM_MAIL} \
-    --partition=${SLURM_PARTITION} \
-    --parsable \
-    ${SCRIPT_DIR}/build_cnvkit_reference.sh \
-    "${NORMAL_SAMPLE_FILE}" \
-    "${NORMAL_DIR}" \
-    "${TARGET_BED}" \
-    "${CNVKIT_REF_DIR}")
-
-echo "  CNVkit reference job: ${CNVKIT_JOB}"
+# CNVKIT_JOB=$(sbatch \
+#     --job-name=cnvkit_ref \
+#     --time=1-00:00:00 \
+#     --ntasks=1 \
+#     --cpus-per-task=8 \
+#     --mem-per-cpu=8G \
+#     --mail-type=ALL \
+#     --mail-user=${SLURM_MAIL} \
+#     --partition=${SLURM_PARTITION} \
+#     --parsable \
+#     ${SCRIPT_DIR}/build_cnvkit_reference.sh \
+#     "${NORMAL_SAMPLE_FILE}" \
+#     "${NORMAL_DIR}" \
+#     "${TARGET_BED}" \
+#     "${CNVKIT_REF_DIR}")
+# 
+# echo "  CNVkit reference job: SKIPPED (using existing)"
 
 # ==============================================================================
 # Step 2: Build Mutect2 Panel of Normals
 # ==============================================================================
 echo "[Step 2] Submitting Mutect2 PoN build..."
 
-PON_JOB=$(sbatch \
-    --job-name=mutect2_pon \
-    --time=2-00:00:00 \
-    --ntasks=1 \
-    --cpus-per-task=8 \
-    --mem-per-cpu=8G \
-    --mail-type=ALL \
-    --mail-user=${SLURM_MAIL} \
-    --partition=${SLURM_PARTITION} \
-    --parsable \
-    ${SCRIPT_DIR}/build_mutect2_pon.sh \
-    "${NORMAL_SAMPLE_FILE}" \
-    "${NORMAL_DIR}" \
-    "${TARGET_BED}" \
-    "${MUTECT2_PON_DIR}")
-
-echo "  Mutect2 PoN job: ${PON_JOB}"
+# PON_JOB=$(sbatch \
+#     --job-name=mutect2_pon \
+#     --time=2-00:00:00 \
+#     --ntasks=1 \
+#     --cpus-per-task=8 \
+#     --mem-per-cpu=8G \
+#     --mail-type=ALL \
+#     --mail-user=${SLURM_MAIL} \
+#     --partition=${SLURM_PARTITION} \
+#     --parsable \
+#     ${SCRIPT_DIR}/build_mutect2_pon.sh \
+#     "${NORMAL_SAMPLE_FILE}" \
+#     "${NORMAL_DIR}" \
+#     "${TARGET_BED}" \
+#     "${MUTECT2_PON_DIR}")
+# 
+# echo "  Mutect2 PoN job: SKIPPED (using existing)"
 
 # ==============================================================================
 # Step 3: Submit Per-Batch Mutation Calling (waits for Steps 1+2)
@@ -163,7 +163,6 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
         --mail-user=${SLURM_MAIL} \
         --partition=${SLURM_PARTITION} \
         --array=1-${ARRAY_SIZE} \
-        --dependency=afterok:${CNVKIT_JOB}:${PON_JOB} \
         --parsable \
         ${SCRIPT_DIR}/mutation_calling_from_bam.sh \
         "${SAMPLE_FILE}" \
