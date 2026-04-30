@@ -9,12 +9,19 @@
 #   Step 4: Summarize all results                  (single job, after Step 3)
 #
 # Usage:
-#   bash run_full_pipeline.sh
+#   bash run_full_pipeline.sh                  # Full run (build PoN + calling)
+#   SKIP_PON_BUILD=true bash run_full_pipeline.sh  # Skip Steps 1+2, reuse existing PoNs
 #
 # All paths are configured below. Edit the BATCHES array to add/remove batches.
 # ==============================================================================
 
 set -euo pipefail
+
+# ==============================================================================
+# Runtime Flags — Override at the command line, e.g.:
+#   SKIP_PON_BUILD=true bash run_full_pipeline.sh
+# ==============================================================================
+SKIP_PON_BUILD="${SKIP_PON_BUILD:-false}"
 
 # ==============================================================================
 # Configuration — Edit this section for your cohort
@@ -61,6 +68,7 @@ echo "  CAPP-Seq Pipeline Orchestrator"
 echo "============================================="
 echo "  Batches: ${#BATCHES[@]}"
 echo "  Normal source: NovaSeqB25"
+echo "  SKIP_PON_BUILD: ${SKIP_PON_BUILD}"
 echo ""
 
 # ==============================================================================
@@ -90,9 +98,12 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
     rename_if_exists "$OUTPUT_DIR"
 done
 
-# Rename shared reference/summary directories
-# rename_if_exists "$CNVKIT_REF_DIR"
-# rename_if_exists "$MUTECT2_PON_DIR"
+# Only rename reference dirs if we are rebuilding them
+if [[ "${SKIP_PON_BUILD}" != "true" ]]; then
+    rename_if_exists "$CNVKIT_REF_DIR"
+    rename_if_exists "$MUTECT2_PON_DIR"
+fi
+
 rename_if_exists "$SUMMARY_DIR"
 
 echo ""
@@ -100,58 +111,81 @@ echo ""
 # ==============================================================================
 # Step 1: Build CNVkit Pooled Normal Reference
 # ==============================================================================
-echo "[Step 1] Submitting CNVkit pooled reference build..."
-
-# CNVKIT_JOB=$(sbatch \
-#     --job-name=cnvkit_ref \
-#     --time=1-00:00:00 \
-#     --ntasks=1 \
-#     --cpus-per-task=8 \
-#     --mem-per-cpu=8G \
-#     --mail-type=ALL \
-#     --mail-user=${SLURM_MAIL} \
-#     --partition=${SLURM_PARTITION} \
-#     --parsable \
-#     ${SCRIPT_DIR}/build_cnvkit_reference.sh \
-#     "${NORMAL_SAMPLE_FILE}" \
-#     "${NORMAL_DIR}" \
-#     "${TARGET_BED}" \
-#     "${CNVKIT_REF_DIR}")
-# 
-# echo "  CNVkit reference job: SKIPPED (using existing)"
+if [[ "${SKIP_PON_BUILD}" == "true" ]]; then
+    echo "[Step 1] SKIPPED — Reusing existing CNVkit reference: ${CNVKIT_REF_DIR}"
+    # Verify the expected output file exists before proceeding
+    if [[ ! -f "${CNVKIT_REF_DIR}/pooled_reference.cnn" ]]; then
+        echo "ERROR: Expected reference file not found: ${CNVKIT_REF_DIR}/pooled_reference.cnn"
+        echo "       Re-run without SKIP_PON_BUILD=true to rebuild."
+        exit 1
+    fi
+    CNVKIT_JOB=""
+else
+    echo "[Step 1] Submitting CNVkit pooled reference build..."
+    CNVKIT_JOB=$(sbatch \
+        --job-name=cnvkit_ref \
+        --time=1-00:00:00 \
+        --ntasks=1 \
+        --cpus-per-task=8 \
+        --mem-per-cpu=8G \
+        --mail-type=ALL \
+        --mail-user=${SLURM_MAIL} \
+        --partition=${SLURM_PARTITION} \
+        --parsable \
+        ${SCRIPT_DIR}/build_cnvkit_reference.sh \
+        "${NORMAL_SAMPLE_FILE}" \
+        "${NORMAL_DIR}" \
+        "${TARGET_BED}" \
+        "${CNVKIT_REF_DIR}")
+    echo "  CNVkit reference job: ${CNVKIT_JOB}"
+fi
 
 # ==============================================================================
 # Step 2: Build Mutect2 Panel of Normals
 # ==============================================================================
-echo "[Step 2] Submitting Mutect2 PoN build..."
-
-# PON_JOB=$(sbatch \
-#     --job-name=mutect2_pon \
-#     --time=2-00:00:00 \
-#     --ntasks=1 \
-#     --cpus-per-task=8 \
-#     --mem-per-cpu=8G \
-#     --mail-type=ALL \
-#     --mail-user=${SLURM_MAIL} \
-#     --partition=${SLURM_PARTITION} \
-#     --parsable \
-#     ${SCRIPT_DIR}/build_mutect2_pon.sh \
-#     "${NORMAL_SAMPLE_FILE}" \
-#     "${NORMAL_DIR}" \
-#     "${TARGET_BED}" \
-#     "${MUTECT2_PON_DIR}")
-# 
-# echo "  Mutect2 PoN job: SKIPPED (using existing)"
+if [[ "${SKIP_PON_BUILD}" == "true" ]]; then
+    echo "[Step 2] SKIPPED — Reusing existing Mutect2 PoN: ${MUTECT2_PON_DIR}"
+    if [[ ! -f "${MUTECT2_PON_DIR}/pon.vcf.gz" ]]; then
+        echo "ERROR: Expected PoN file not found: ${MUTECT2_PON_DIR}/pon.vcf.gz"
+        echo "       Re-run without SKIP_PON_BUILD=true to rebuild."
+        exit 1
+    fi
+    PON_JOB=""
+else
+    echo "[Step 2] Submitting Mutect2 PoN build..."
+    PON_JOB=$(sbatch \
+        --job-name=mutect2_pon \
+        --time=2-00:00:00 \
+        --ntasks=1 \
+        --cpus-per-task=8 \
+        --mem-per-cpu=8G \
+        --mail-type=ALL \
+        --mail-user=${SLURM_MAIL} \
+        --partition=${SLURM_PARTITION} \
+        --parsable \
+        ${SCRIPT_DIR}/build_mutect2_pon.sh \
+        "${NORMAL_SAMPLE_FILE}" \
+        "${NORMAL_DIR}" \
+        "${TARGET_BED}" \
+        "${MUTECT2_PON_DIR}")
+    echo "  Mutect2 PoN job: ${PON_JOB}"
+fi
 
 # ==============================================================================
-# Step 3: Submit Per-Batch Mutation Calling (waits for Steps 1+2)
+# Step 3: Submit Per-Batch Mutation Calling (waits for Steps 1+2 if submitted)
 # ==============================================================================
-echo "[Step 3] Submitting per-batch mutation calling (after reference builds)..."
+echo "[Step 3] Submitting per-batch mutation calling..."
 
 CALLING_JOBS=""
 
 for BATCH_ENTRY in "${BATCHES[@]}"; do
     IFS='|' read -r BATCH_NAME SAMPLE_FILE CFDNA_DIR OUTPUT_DIR ARRAY_SIZE <<< "$BATCH_ENTRY"
+
+    # Build the dependency string only if PoN jobs were submitted
+    DEPENDENCY_ARG=""
+    if [[ -n "${CNVKIT_JOB}" && -n "${PON_JOB}" ]]; then
+        DEPENDENCY_ARG="--dependency=afterok:${CNVKIT_JOB}:${PON_JOB}"
+    fi
 
     BATCH_JOB=$(sbatch \
         --job-name=${BATCH_NAME} \
@@ -163,6 +197,7 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
         --mail-user=${SLURM_MAIL} \
         --partition=${SLURM_PARTITION} \
         --array=1-${ARRAY_SIZE} \
+        ${DEPENDENCY_ARG} \
         --parsable \
         ${SCRIPT_DIR}/mutation_calling_from_bam.sh \
         "${SAMPLE_FILE}" \
@@ -221,14 +256,21 @@ echo "============================================="
 echo "  All Jobs Submitted!"
 echo "============================================="
 echo ""
-echo "  Dependency chain:"
-echo "    Step 1: CNVkit ref   [${CNVKIT_JOB}]  ──┐"
-echo "    Step 2: Mutect2 PoN  [${PON_JOB}]  ──┤"
-echo "                                           ▼"
-echo "    Step 3: Calling      [${CALLING_JOBS}]"
-echo "                                           ▼"
-echo "    Step 4: Summarize    [${SUMMARY_JOB}]"
+if [[ "${SKIP_PON_BUILD}" == "true" ]]; then
+    echo "  Dependency chain (PoN steps skipped):"
+    echo "    Step 3: Calling   [${CALLING_JOBS}]"
+    echo "                           ▼"
+    echo "    Step 4: Summarize [${SUMMARY_JOB}]"
+else
+    echo "  Dependency chain:"
+    echo "    Step 1: CNVkit ref  [${CNVKIT_JOB}]  ──┐"
+    echo "    Step 2: Mutect2 PoN [${PON_JOB}]  ──┤"
+    echo "                                          ▼"
+    echo "    Step 3: Calling     [${CALLING_JOBS}]"
+    echo "                                          ▼"
+    echo "    Step 4: Summarize   [${SUMMARY_JOB}]"
+fi
 echo ""
 echo "  Monitor with: squeue -u \$USER"
-echo "  Cancel all:   scancel ${CNVKIT_JOB} ${PON_JOB} ${CALLING_JOBS} ${SUMMARY_JOB}"
+echo "  Cancel all:   scancel ${CALLING_JOBS} ${SUMMARY_JOB}"
 echo "============================================="
