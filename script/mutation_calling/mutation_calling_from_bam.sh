@@ -322,7 +322,7 @@ else
 
             # Step 3.0b-ii: Binomial test for segment-level p-values
             BINTEST_OUT="${TMP_CNS%.cns}.bintest.cns"
-            cnvkit.py bintest "$TMP_CNR" -s "$CALL_OUT" -t 0.05 > "$BINTEST_OUT"
+            cnvkit.py bintest "$TMP_CNR" -s "$CALL_OUT" > "$BINTEST_OUT"
         fi
     else
         echo "WARNING: cnvkit.py not found after attempting to load conda env. Skipping CNV calling."
