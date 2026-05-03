@@ -13,7 +13,7 @@ suppressPackageStartupMessages({
 })
 
 # Define paths (absolute to avoid working directory issues)
-PROJECT_DIR <- "/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/my_AI_agent"
+PROJECT_DIR <- "/Users/Brian/Library/CloudStorage/Box-Box/BrianAnalysis/Lymphoma/NLPHL"
 DATA_DIR <- file.path(PROJECT_DIR, "data")
 RESULTS_DIR <- file.path(DATA_DIR, "combined_summary")
 MUTECT_FILE <- file.path(RESULTS_DIR, "mutect2_variants.tsv")
@@ -23,7 +23,8 @@ SV_FILE <- file.path(RESULTS_DIR, "manta_somatic_svs.tsv")
 OUTPUT_PDF <- file.path(PROJECT_DIR, "analysis", "cohort_oncoprint.pdf")
 
 # PoN frequency summary from build_mutect2_pon.sh (set to NA to skip PoN filtering)
-PON_SUMMARY_FILE <- file.path(DATA_DIR, "mutect2_pon", "pon_site_summary.tsv")
+# Lives in combined_summary/ as written by summarize_variant_calls.sh on Sherlock.
+PON_SUMMARY_FILE <- file.path(RESULTS_DIR, "pon_site_summary.tsv")
 
 # COSMIC coding mutations VCF for rescue logic (set to NA to skip COSMIC rescue)
 # Download from: https://cancer.sanger.ac.uk/cosmic/download (requires free registration)
@@ -241,7 +242,9 @@ altering_effects <- c(
   "splice_acceptor_variant", "splice_donor_variant",
   "splice_acceptor_variant&intron_variant", "splice_donor_variant&intron_variant",
   "inframe_deletion", "inframe_insertion", "disruptive_inframe_deletion",
-  "disruptive_inframe_insertion", "start_lost",
+  "disruptive_inframe_insertion",
+  "conservative_inframe_deletion", "conservative_inframe_insertion",
+  "start_lost",
   "stop_lost", "5_prime_UTR_premature_start_codon_gain_variant",
   "missense_variant&splice_region_variant"
 )
@@ -334,6 +337,24 @@ if (file.exists(CNVKIT_FILE)) {
       mutate(Seg_Size = End - Start) %>%
       filter(!(Seg_Size > 10e6 & abs(Log2_Ratio) < 0.5)) %>%
       select(-Seg_Size)
+
+    # 4. Bintest evidence filter: require >= 1 bin inside the segment to have
+    #    passed CNVkit bintest (p_bintest <= 0.005 by default). Segments called
+    #    by CBS but with zero significant bins are likely smoothing artifacts.
+    #    Backward compatible: only applies if the column exists (i.e., the
+    #    summarize_variant_calls.sh that emits Min_P_Value / N_Significant_Bins
+    #    has been run).
+    if ("N_Significant_Bins" %in% colnames(cnv_seg_data)) {
+      n_pre_bintest <- nrow(cnv_seg_data)
+      cnv_seg_data <- cnv_seg_data %>%
+        filter(N_Significant_Bins >= 1)
+      cat(sprintf(
+        "  Bintest evidence filter: %d -> %d segments (removed %d with no significant bins)\n",
+        n_pre_bintest, nrow(cnv_seg_data), n_pre_bintest - nrow(cnv_seg_data)
+      ))
+    } else {
+      cat("  Bintest evidence filter: SKIPPED (N_Significant_Bins column not in TSV — re-run summarize_variant_calls.sh)\n")
+    }
 
     cat(sprintf(
       "  CNV segments: %d total -> %d after artifact filters (removed %d)\n",
@@ -615,41 +636,48 @@ heatmap_subtitle <- "SNVs | Indels | Copy Number Variants | Structural Variants"
 # Generate PDF
 pdf(OUTPUT_PDF, width = max(14, ncol(onco_mat_plot) * 0.6 + 4), height = max(10, nrow(onco_mat_plot) * 0.35 + 3))
 
-oncoPrint(
-  onco_mat_plot,
-  alter_fun = alter_fun_used,
-  col = col_used,
-  remove_empty_columns = FALSE,
-  remove_empty_rows = TRUE,
-  row_split = row_splits,
-  cluster_row_slices = FALSE, # Prevents flipping the order of the two sections randomly
-  row_title_gp = gpar(fontsize = 12, fontface = "bold"),
-  row_names_gp = gpar(fontsize = 9, fontface = "italic"),
-  show_column_names = TRUE,
-  column_names_gp = gpar(fontsize = 9, fontface = "bold"),
-  column_names_side = "bottom",
-  pct_gp = gpar(fontsize = 8),
-  column_title = paste0(heatmap_title, "\n", heatmap_subtitle),
-  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-  heatmap_legend_param = list(
-    title = "Alterations",
-    at = names(col_used),
-    labels = legend_labels,
-    nrow = 3
-  ),
-  top_annotation = HeatmapAnnotation(
-    cbar = anno_oncoprint_barplot(
-      border = TRUE
+if (nrow(onco_mat_plot) == 0 || ncol(onco_mat_plot) == 0) {
+  cat("  No variants left to plot after filtering. Creating an empty PDF placeholder.\n")
+  plot.new()
+  text(0.5, 0.5, "No somatic variants passed filtering across all samples.", cex = 1.2)
+} else {
+  p <- oncoPrint(
+    onco_mat_plot,
+    alter_fun = alter_fun_used,
+    col = col_used,
+    remove_empty_columns = FALSE,
+    remove_empty_rows = TRUE,
+    row_split = row_splits,
+    cluster_row_slices = FALSE, # Prevents flipping the order of the two sections randomly
+    row_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    row_names_gp = gpar(fontsize = 9, fontface = "italic"),
+    show_column_names = TRUE,
+    column_names_gp = gpar(fontsize = 9, fontface = "bold"),
+    column_names_side = "bottom",
+    pct_gp = gpar(fontsize = 8),
+    column_title = paste0(heatmap_title, "\n", heatmap_subtitle),
+    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+    heatmap_legend_param = list(
+      title = "Alterations",
+      at = names(col_used),
+      labels = legend_labels,
+      nrow = 3
     ),
-    annotation_height = unit(2, "cm")
-  ),
-  right_annotation = rowAnnotation(
-    rbar = anno_oncoprint_barplot(
-      border = TRUE
+    top_annotation = HeatmapAnnotation(
+      cbar = anno_oncoprint_barplot(
+        border = TRUE
+      ),
+      annotation_height = unit(2, "cm")
     ),
-    annotation_width = unit(2, "cm")
+    right_annotation = rowAnnotation(
+      rbar = anno_oncoprint_barplot(
+        border = TRUE
+      ),
+      annotation_width = unit(2, "cm")
+    )
   )
-)
+  draw(p)
+}
 
 dev.off()
 

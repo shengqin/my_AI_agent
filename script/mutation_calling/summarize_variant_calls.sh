@@ -73,7 +73,7 @@ echo "Sample,Batch,Pipeline_Status,Mutect2_Total,Mutect2_PASS,Manta_PASS_SVs,Man
 
 echo -e "Sample\tBatch\tChromosome\tPosition\tRef\tAlt\tFilter\tGene\tVariant_Type\tProtein_Change\tTumor_AF\tTumor_AD_Ref\tTumor_AD_Alt\tTumor_DP\tNormal_AF\tNormal_DP\tTumor_F1R2\tTumor_F2R1" > "$MUTECT_DETAILS"
 
-echo -e "Sample\tBatch\tChromosome\tStart\tEnd\tLog2_Ratio\tCopy_Number\tDepth\tWeight\tProbes\tP_Value\tCall_Type" > "$CNV_DETAILS"
+echo -e "Sample\tBatch\tChromosome\tStart\tEnd\tLog2_Ratio\tCopy_Number\tDepth\tWeight\tProbes\tMin_P_Value\tN_Significant_Bins\tCall_Type" > "$CNV_DETAILS"
 
 echo -e "Sample\tBatch\tChromosome\tPosition\tSV_Type\tFilter\tQual\tMate_Chrom\tMate_Pos" > "$SV_DETAILS"
 
@@ -138,6 +138,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         # Fallback: if SM not found (e.g. patched names), assume col10=tumor, col11=normal
         [[ -z "$TUMOR_COL" ]] && TUMOR_COL=10
         [[ -z "$NORMAL_COL" ]] && NORMAL_COL=11
+        return 0
     }
 
     # Read the tumor and normal SM tags from BAM headers (same as mutation_calling_from_bam.sh)
@@ -275,7 +276,11 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     if [[ -f "$CALL_CNS" ]]; then
         CNVKIT_OK=true
 
-        # Build a p-value lookup from bintest.cns (keyed by chr:start:end)
+        # Build a bin-level p-value table from bintest.cns.
+        # Each row in bintest.cns is one ~100-300bp probe bin; each row in
+        # call.cns is a CBS segment that can span megabases. The two cannot
+        # be joined on (chr,start,end) — the keys are at different granularities.
+        # Instead we dump bins to a temp table and range-scan them per segment.
         PVAL_TMPFILE=""
         if [[ -f "$BINTEST_CNS" ]]; then
             PVAL_TMPFILE=$(mktemp)
@@ -286,7 +291,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
                 chr=( "chromosome" in col ? $col["chromosome"] : $1 )
                 s=  ( "start"      in col ? $col["start"]      : $2 )
                 e=  ( "end"        in col ? $col["end"]        : $3 )
-                pv= ( "p-value"    in col ? $col["p-value"]    : "." )
+                pv= ( "p_bintest"  in col ? $col["p_bintest"]  : ( "p-value" in col ? $col["p-value"] : "." ) )
                 if (pv == "") pv = "."
                 print chr"\t"s"\t"e"\t"pv
             }' "$BINTEST_CNS" > "$PVAL_TMPFILE"
@@ -299,16 +304,26 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             $h["cn"]<2 && $h["log2"]<-0.3{c++} END{print c+0}' "$CALL_CNS")
         CNV_ABERRANT=$((CNV_AMP + CNV_DEL))
 
-        # Extract aberrant segments with header-based parsing
+        # Extract aberrant segments and aggregate bin p-values per segment:
+        #   Min_P_Value         — smallest p-value among bins fully inside the segment
+        #   N_Significant_Bins  — count of those bins
+        # bintest.cns by default emits ONLY significant bins (p_bintest <= 0.005),
+        # so N_Significant_Bins == 0 means the CBS-called segment had no bin that
+        # passed bintest — useful as a downstream "evidence" filter.
         awk -F'\t' -v sample="$SAMPLE_NAME" -v batch="$BATCH_NAME" \
             -v pval_file="${PVAL_TMPFILE:-}" '
         NR==1 {
             for(i=1;i<=NF;i++) h[$i]=i
-            # Load p-value lookup if file exists
+            # Load bin-level p-values into parallel arrays
+            n_bins = 0
             if (pval_file != "") {
                 while ((getline line < pval_file) > 0) {
                     split(line, pf, "\t")
-                    pval_lookup[pf[1]"\t"pf[2]"\t"pf[3]] = pf[4]
+                    n_bins++
+                    bin_chr[n_bins]   = pf[1]
+                    bin_start[n_bins] = pf[2] + 0
+                    bin_end[n_bins]   = pf[3] + 0
+                    bin_pv[n_bins]    = pf[4]
                 }
                 close(pval_file)
             }
@@ -316,8 +331,8 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         }
         {
             chr     = $h["chromosome"]
-            s       = $h["start"]
-            e       = $h["end"]
+            s       = $h["start"] + 0
+            e       = $h["end"] + 0
             log2val = $h["log2"]
             depth   = $h["depth"]
             probes  = $h["probes"]
@@ -329,11 +344,24 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             else if (cn < 2 && log2val < -0.3) call_type = "Deletion"
             else next
 
-            # Lookup p-value from bintest
-            key = chr"\t"s"\t"e
-            pv = (key in pval_lookup) ? pval_lookup[key] : "."
+            # Range-scan bins on the same chromosome that fall fully inside this segment
+            min_pv_str = ""
+            min_pv_num = 0
+            n_sig = 0
+            for (i = 1; i <= n_bins; i++) {
+                if (bin_chr[i] != chr) continue
+                if (bin_start[i] >= s && bin_end[i] <= e) {
+                    n_sig++
+                    this_pv = bin_pv[i] + 0
+                    if (min_pv_str == "" || this_pv < min_pv_num) {
+                        min_pv_str = bin_pv[i]
+                        min_pv_num = this_pv
+                    }
+                }
+            }
+            if (min_pv_str == "") min_pv_str = "."
 
-            print sample"\t"batch"\t"chr"\t"s"\t"e"\t"log2val"\t"cn"\t"depth"\t"weight"\t"probes"\t"pv"\t"call_type
+            print sample"\t"batch"\t"chr"\t"s"\t"e"\t"log2val"\t"cn"\t"depth"\t"weight"\t"probes"\t"min_pv_str"\t"n_sig"\t"call_type
         }' "$CALL_CNS" >> "$CNV_DETAILS"
 
         # Cleanup temp file
@@ -345,7 +373,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     #
     # ROBUST PARSING: Uses header-based column lookup.
     # genemetrics columns: chromosome,start,end,gene,log2,depth,weight,probes,
-    #                      segment_log2,segment_probes
+    #                      seg_weight,seg_probes
     # ================================================================
     GENEMETRICS_FILE=$(find "$SAMPLE_DIR/cnvkit_run" -name "*_genemetrics.tsv" 2>/dev/null | head -n 1)
 
@@ -364,14 +392,14 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             depth  = $h["depth"]
             weight = $h["weight"]
             probes = $h["probes"]
-            seg_l2 = ("segment_log2"   in h) ? $h["segment_log2"]   : "."
-            seg_pr = ("segment_probes" in h) ? $h["segment_probes"] : "."
+            seg_wt = ("seg_weight" in h) ? $h["seg_weight"] : "."
+            seg_pr = ("seg_probes" in h) ? $h["seg_probes"] : "."
 
             if (log2v > 0.2) call_type = "Amplification"
             else if (log2v < -0.2) call_type = "Deletion"
             else next
 
-            print sample"\t"batch"\t"gene"\t"chr"\t"s"\t"e"\t"log2v"\t"depth"\t"weight"\t"probes"\t"seg_l2"\t"seg_pr"\t"call_type
+            print sample"\t"batch"\t"gene"\t"chr"\t"s"\t"e"\t"log2v"\t"depth"\t"weight"\t"probes"\t"seg_wt"\t"seg_pr"\t"call_type
         }' "$GENEMETRICS_FILE" >> "$CNV_GENE_DETAILS"
     fi
 
