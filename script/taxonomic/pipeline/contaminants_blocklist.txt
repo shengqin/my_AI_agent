@@ -1,0 +1,84 @@
+# =============================================================================
+# contaminants_blocklist.txt
+# Common reagent / laboratory ("kitome") contaminant genera. Step 05 removes any
+# taxon whose GENUS or SPECIES (case-insensitive) matches a line here.
+#
+# Curated mainly from Salter et al. 2014 (Genome Biol) "Reagent and laboratory
+# contamination can critically impact sequence-based microbiome analyses" plus
+# additions commonly seen in low-biomass FFPE/tumor RNA-seq. ONE name per line;
+# text after '#' is ignored. This is a screening aid, NOT a substitute for
+# sequencing true negative controls -- edit to fit your wet-lab/reagent lots.
+# =============================================================================
+
+# --- Salter 2014 core reagent contaminants ---
+Afipia
+Aquabacterium
+Asticcacaulis
+Aurantimonas
+Beijerinckia
+Bosea
+Bradyrhizobium
+Brevundimonas
+Caulobacter
+Chryseobacterium
+Comamonas
+Cupriavidus
+Curvibacter
+Delftia
+Devosia
+Dietzia
+Elizabethkingia
+Herbaspirillum
+Hydrogenophaga
+Janthinobacterium
+Kaistobacter
+Leifsonia
+Limnobacter
+Mesorhizobium
+Methylobacterium
+Methylophilus
+Methyloversatilis
+Mycobacterium       # also a real pathogen -- review hits before discarding
+Novosphingobium
+Ochrobactrum
+Paracoccus
+Pelomonas
+Phyllobacterium
+Polaromonas
+Propionibacterium   # see Cutibacterium
+Cutibacterium       # C. acnes -- ubiquitous skin/reagent contaminant
+Pseudomonas         # frequent contaminant AND opportunistic pathogen -- review
+Ralstonia
+Rhodococcus
+Sphingobium
+Sphingomonas
+Sphingopyxis
+Stenotrophomonas
+Variovorax
+Xanthomonas
+
+# --- Other frequent low-biomass / skin / environmental contaminants ---
+Acidovorax
+Acinetobacter       # review -- can be real
+Agrobacterium
+Bacillus
+Burkholderia
+Chryseomonas
+Corynebacterium     # skin; review
+Escherichia         # lab/cloning vector source -- review carefully
+Flavobacterium
+Massilia
+Microbacterium
+Micrococcus
+Paenibacillus
+Pedobacter
+Rhizobium
+Rothia
+Staphylococcus      # skin; review -- can be real
+Streptococcus       # oral/skin; review -- can be real
+
+# --- Common sequencing artifacts / DB decoys ---
+synthetic construct
+Cloning vector
+Enterobacteria phage phiX174
+Escherichia virus phiX174

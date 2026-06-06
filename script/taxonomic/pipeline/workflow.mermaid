@@ -1,0 +1,37 @@
+flowchart TD
+    A["Trimmed FASTQs<br/>(192 samples, fastp)"] --> B{{"STEP 01 — host removal"}}
+
+    B --> B1["STAR to GRCh38 (2-pass, FFPE-relaxed)"]
+    B1 -- "drop reads that MAP (human)" --> X1[(host reads removed)]
+    B1 --> B2["bbduk: host rRNA"]
+    B2 -- "drop host rRNA k-mer matches" --> X2[(rRNA removed)]
+    B2 --> B3["bbduk: low-complexity (entropy)"]
+    B3 -- "drop simple-repeat reads" --> X3[(low-complexity removed)]
+    B3 --> B4["clumpify: duplicates"]
+    B4 -- "collapse PCR/optical dups" --> X4[(duplicates removed)]
+    B4 --> C["Candidate-microbial reads<br/>(per-sample read accounting)"]
+
+    C --> D{{"STEP 02 — Kraken2 (DNA)"}}
+    C --> E{{"STEP 04 — Kaiju (protein)"}}
+
+    D -- "confidence 0.1 + min-hit-groups 3<br/>(rest -> unclassified)" --> F{{"STEP 03 — Bracken<br/>species + genus"}}
+    E -- "greedy, -e 3" --> G{{"STEP 04b — kaiju2table"}}
+
+    F --> H{{"STEP 05 — merge + filter + cross-validate"}}
+    G --> H
+
+    H --> H1["remove human (Homo sapiens)"]
+    H1 --> H2["kitome blocklist (Salter 2014)"]
+    H2 --> H3["distinct-minimizer filter (KrakenUniq-style)"]
+    H3 --> H4["abundance + prevalence filters"]
+    H4 --> H5["Kraken2 &cap; Kaiju concordance"]
+    H5 --> I["HIGH-CONFIDENCE TAXA"]
+
+    I --> J{{"STEP 06 — figures + pipeline_summary.txt"}}
+
+    classDef step fill:#1F3864,stroke:#1F3864,color:#fff;
+    classDef drop fill:#F4CCCC,stroke:#B22222,color:#333;
+    classDef out fill:#D5E8D4,stroke:#2E7D32,color:#1b1b1b;
+    class B,D,E,F,G,H,J step;
+    class X1,X2,X3,X4 drop;
+    class C,I out;
