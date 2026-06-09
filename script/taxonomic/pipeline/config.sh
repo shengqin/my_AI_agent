@@ -132,10 +132,15 @@ export KAIJU_MISMATCHES="3"           # -e 3
 # 6. DOWNSTREAM FILTERING / DECONTAMINATION   (step 05)
 # ---------------------------------------------------------------------------
 export CONTAMINANT_BLOCKLIST="$PIPELINE_DIR/contaminants_blocklist.txt"
-export MIN_READS="10"                  # min reads for a taxon to be kept in a sample
+export MIN_READS="10"                  # min Kraken2/Bracken reads for a taxon in a sample
 export MIN_RPM="1"                     # min reads per million INPUT read pairs (depth-normalized:
                                        # denominator = STAR "Number of input reads", i.e. the full
                                        # pre-host library, NOT the post-host microbial pool)
+export KAIJU_MIN_READS="5"             # min Kaiju reads for a taxon to ENTER cross-validation.
+                                       # Lower than MIN_READS on purpose: Kaiju is protein-only,
+                                       # cannot classify rRNA, and is less sensitive on short FFPE
+                                       # reads, so a real organism legitimately yields fewer Kaiju
+                                       # reads. >=5 kills single-read noise without over-penalizing.
 export MIN_PREVALENCE_FRAC="0.0"       # set >0 to require detection in a fraction of samples
 export MIN_MINIMIZER_COVERAGE="0.01"   # Kraken2 distinct-minimizers / total k-mers floor
 export MIN_DISTINCT_MINIMIZERS="10"    # min distinct minimizers to keep a taxon (KrakenUniq-style)

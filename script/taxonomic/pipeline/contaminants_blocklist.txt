@@ -77,6 +77,45 @@ Rothia
 Staphylococcus      # skin; review -- can be real
 Streptococcus       # oral/skin; review -- can be real
 
+# --- Modern reagent/kitome contaminants (Eisenhofer 2019 Trends Microbiol;
+#     Poore 2020 Nature; plus genera seen at high prevalence + low RPM in THIS
+#     NLPHL cohort). High prevalence with low RPM is a contamination signature. ---
+Schlegelella        # = Caldimonas aquatica; ~89% prevalence here, water/reagent
+Caldimonas          # reclassified Schlegelella; environmental/reagent
+Tepidimonas         # thermophilic betaproteobacterium; reagent/water (taiwanensis)
+Paracidovorax       # split from Acidovorax (avenae); plant/environmental
+Achromobacter
+Aeromonas           # review -- can be a real pathogen
+Brachybacterium
+Brevibacillus
+Brevibacterium
+Cellulomonas
+Cellulosimicrobium
+Cloacibacterium
+Dyella
+Empedobacter
+Enhydrobacter
+Geobacillus
+Janibacter
+Knoellia
+Kocuria
+Leptothrix
+Marinobacter
+Microvirga
+Moraxella           # review -- can be real
+Nocardioides
+Oligella
+Pseudoxanthomonas
+Psychrobacter
+Roseomonas
+Sediminibacterium
+Shinella
+Tepidiphilus
+Tessaracoccus
+Thermomonas
+Williamsia
+Zoogloea
+
 # --- Common sequencing artifacts / DB decoys ---
 synthetic construct
 Cloning vector

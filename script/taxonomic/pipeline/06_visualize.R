@@ -45,10 +45,17 @@ if (file.exists(qc_path)) {
       pivot_longer(-sample, names_to = "stage", values_to = "reads") %>%
       mutate(stage = factor(stage, levels = rmcols)) %>%
       ggplot(aes(stage, reads)) + geom_boxplot(fill = "#4682B4", alpha = .6) +
-      scale_y_continuous(labels = comma) + theme_minimal(base_size = 11) +
+      # pseudo-log y so the small later stages (rRNA/low-complexity/dup/T2T) are
+      # readable even though host_removed_STAR dwarfs them on a linear scale.
+      # pseudo_log (unlike log10) renders the legitimate zero-removal values.
+      scale_y_continuous(trans = scales::pseudo_log_trans(base = 10),
+                         breaks = c(0, 1e3, 1e4, 1e5, 1e6, 1e7),
+                         labels = comma) +
+      theme_minimal(base_size = 11) +
       theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
       labs(title = "Read pairs removed per cleanup stage (across samples)",
-           x = "", y = "read pairs removed")))
+           subtitle = "log-scaled y-axis; host removal dwarfs later stages on a linear scale",
+           x = "", y = "read pairs removed (pseudo-log scale)")))
   # Kraken2 unclassified rate (reads not passing confidence / min-hit-groups, or no DB hit)
   if ("pct_unclassified" %in% names(qc)) op(print(
     qc %>% ggplot(aes(as.numeric(pct_unclassified))) +
@@ -100,7 +107,11 @@ conc <- xv %>% filter(reads > 0 | kaiju_reads > 0)
 if (nrow(conc) > 0 && "kaiju_reads" %in% names(conc)) {
   pdf(file.path(FIGS_DIR, "kraken2_vs_kaiju_concordance.pdf"), width = 9, height = 8)
   op(print(
-    conc %>% ggplot(aes(reads + 1, kaiju_reads + 1, colour = detected_by)) +
+    # kaiju_only rows have no Kraken2 reads (reads = NA), so they cannot sit on a
+    # Kraken2-vs-Kaiju scatter; drop them here (the bar chart below still counts
+    # all three categories) to avoid an empty kaiju_only legend entry.
+    conc %>% filter(detected_by != "kaiju_only") %>%
+      ggplot(aes(reads + 1, kaiju_reads + 1, colour = detected_by)) +
       geom_point(alpha = 0.4, size = 0.8) +
       scale_x_log10(labels = comma) + scale_y_log10(labels = comma) +
       geom_abline(linetype = "dashed", colour = "grey50") +

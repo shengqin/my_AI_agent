@@ -29,24 +29,28 @@ renders this as a diagram in the Cowork file viewer.)
         │                                 │
  STEP 02 Kraken2 (DNA)            STEP 04 Kaiju (protein)
    conf 0.1 + hit-groups 3          greedy, -e 3
-   (rest -> unclassified)                 │
+   (rest -> unclassified)          STEP 04b kaiju2table
         │                                 │
- STEP 03 Bracken (species+genus)   STEP 04b kaiju2table
+ STEP 03 Bracken (species+genus)   Kaiju pre-filter: >= KAIJU_MIN_READS & non-human
+        │                            (sub-threshold/human ─ drop ─> kaiju_filtered_out.csv.gz)
         └──────────────┬──────────────────┘
                        ▼
- STEP 05 merge + filter + cross-validate
+ STEP 05 merge + cross-validate (match by NCBI taxid OR genus-aware name)
+        │  -> 3-way label: both | kraken2_only | kaiju_only
         ── remove human ───────────────── drop
-        ── kitome blocklist ───────────── drop
+        ── kitome blocklist ──────────── flag+drop
         ── distinct-minimizer filter ──── drop   (counts: filter_funnel_summary.csv)
         ── abundance + prevalence ─────── drop
-        ── Kraken2 ∩ Kaiju concordance ── drop
+        ── Kraken2 ∩ Kaiju concordance ── drop   (failed calls ─> rejected_calls.csv.gz)
                        ▼
             HIGH-CONFIDENCE TAXA  ->  STEP 06 figures + pipeline_summary.txt
 ```
 
 Read-level drops (host, rRNA, low-complexity, dups, Kraken2/Kaiju unclassified) land in
 `QC_read_accounting.csv`; taxon-level drops (the discovery filters) land in
-`filter_funnel_summary.csv`; `pipeline_summary.txt` narrates both in one page.
+`filter_funnel_summary.csv`; every call that failed ≥1 gate is preserved with its
+`fail_reason` in `rejected_calls.csv.gz` (and the sub-threshold Kaiju tail in
+`kaiju_filtered_out.csv.gz`); `pipeline_summary.txt` narrates it all in one page.
 
 ---
 
@@ -88,7 +92,7 @@ sbatch            05_downstream.sbatch              # after 03 and 04b
 | 03 | `03_bracken_merge.sbatch` | Bracken (species+genus), BIOM merge, KrakenUniq-style minimizer table, RPM lookup |
 | 04 | `04_kaiju.sbatch` | Kaiju protein search vs `nr_euk` (greedy, -e 3) |
 | 04b | `04b_kaiju2table.sbatch` | merge Kaiju into cohort matrices |
-| 05 | `05_downstream.sbatch` → `05_aggregate_filter.R`, `06_visualize.R` | host/contaminant removal, filters, **Kraken2 ∩ Kaiju** cross-validation, optional decontam, plots |
+| 05 | `05_downstream.sbatch` → `05_aggregate_filter.R`, `06_visualize.R` | Kaiju pre-filter (≥`KAIJU_MIN_READS`), host/contaminant removal, filters, **Kraken2 ∩ Kaiju** cross-validation (3-way breakdown), optional decontam, plots; writes a provenance `run_manifest.txt` |
 
 ---
 
@@ -109,8 +113,11 @@ got the 2020 TCGA pan-cancer microbiome paper **retracted**. Fixes built in here
   host is trapped as *Homo sapiens* and then removed.
 - **Two orthogonal classifiers**: a taxon is **high-confidence only if both**
   Kraken2 (nucleotide; sees rRNA) and Kaiju (protein; robust to FFPE damage)
-  call it. Pico-kit libraries keep microbial rRNA, so Kraken2 will out-detect
-  Kaiju for bacteria — concordance is the believable core.
+  call it. Kaiju is pre-filtered to **≥`KAIJU_MIN_READS` (default 5) non-human
+  reads** before cross-validation, so concordance means a *meaningful* Kaiju call
+  corroborates Kraken2 — not a single stray read. Pico-kit libraries keep
+  microbial rRNA, so Kraken2 will out-detect Kaiju for bacteria — concordance is
+  the believable core.
 - **Kitome blocklist** (`contaminants_blocklist.txt`, Salter 2014) and an
   optional **`decontam`** hook for true negative controls.
 
@@ -133,9 +140,15 @@ got the 2020 TCGA pan-cancer microbiome paper **retracted**. Fixes built in here
   (downloads the prebuilt CHM13v2.0 bowtie2 index). With `T2T_BT2_INDEX` set,
   step 01 removes residual human that GRCh38 misses; absent, B4 just skips.
 - **FP stringency**: `KRAKEN2_CONFIDENCE` (0.1), `KRAKEN2_MIN_HIT_GROUPS` (3),
-  `MIN_MINIMIZER_COVERAGE` (0.01), `MIN_DISTINCT_MINIMIZERS` (10).
-- **Abundance/prevalence**: `MIN_READS` (10), `MIN_RPM` (1),
-  `MIN_PREVALENCE_FRAC` (0 = off).
+  `MIN_MINIMIZER_COVERAGE` (0.01), `MIN_DISTINCT_MINIMIZERS` (10). Note: species
+  that gained reads only via Bracken redistribution have no minimizer row and
+  "fail open" through this gate; `pipeline_summary.txt` reports how many
+  high-confidence calls passed on real evidence vs fail-open.
+- **Abundance/prevalence**: `MIN_READS` (10 Kraken2/Bracken reads), `MIN_RPM` (1),
+  `MIN_PREVALENCE_FRAC` (0 = off), and `KAIJU_MIN_READS` (5) — the separate, lower
+  Kaiju floor for entering cross-validation (Kaiju is protein-only and less
+  sensitive on short FFPE reads, so a real organism legitimately yields fewer
+  Kaiju reads).
 - **Decontam**: set `CONTROLS_LIST` to a `sample<TAB>type` TSV (`type` =
   `sample`|`control`) to enable. Leave empty to rely on the blocklist only.
 - **Concordance**: `REQUIRE_BOTH_CLASSIFIERS=true` makes "high-confidence"
@@ -146,8 +159,8 @@ got the 2020 TCGA pan-cancer microbiome paper **retracted**. Fixes built in here
 ## Outputs (`05_results/`)
 
 - `cross_validated_species.csv` — every sample×species call with all metrics and
-  pass/fail flags (host, blocklist, minimizer, abundance, prevalence,
-  `detected_by`, `high_confidence`).
+  pass/fail flags (host, blocklist, minimizer, `minimizer_failopen`, abundance,
+  prevalence, `detected_by` = both/kraken2_only/kaiju_only, `high_confidence`).
 - `high_confidence_taxa.csv` — the filtered, believable subset.
 - `cohort_high_confidence_summary.csv` — per-species prevalence and RPM summary.
 - `pipeline_summary.txt` — **one-page plain-language run summary**: median read
@@ -162,6 +175,15 @@ got the 2020 TCGA pan-cancer microbiome paper **retracted**. Fixes built in here
 - `filter_funnel_summary.csv` — cohort-level count of sample-taxon calls
   surviving each gate (host → blocklist → minimizer → abundance → prevalence →
   classifier concordance → high-confidence), with `calls_dropped_here`.
+- `rejected_calls.csv.gz` — every call that failed ≥1 high-confidence gate, with a
+  `fail_reason` column naming which gate(s) (host, kitome_contaminant,
+  no_classifier_concordance, low_abundance, low_distinct_minimizers,
+  low_prevalence, decontam_contaminant) — the auditable complement of
+  `high_confidence_taxa.csv`.
+- `kaiju_filtered_out.csv.gz` — the sub-`KAIJU_MIN_READS` / human Kaiju tail removed
+  before cross-validation (preserved, not silently discarded).
+- `run_manifest.txt` — provenance: parameter values, tool + DB versions/mtimes, and
+  the git commit for the run.
 - `decontam_contaminants.csv` — only if controls were supplied.
 
 Figures (`06_figures/`): read-accounting QC (incl. per-stage removals and

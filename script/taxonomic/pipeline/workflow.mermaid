@@ -1,37 +1,61 @@
 flowchart TD
     A["Trimmed FASTQs<br/>(192 samples, fastp)"] --> B{{"STEP 01 — host removal"}}
 
-    B --> B1["STAR to GRCh38 (2-pass, FFPE-relaxed)"]
+    B --> B1["STAR &rarr; GRCh38 (FFPE-relaxed); keep UNMAPPED"]
     B1 -- "drop reads that MAP (human)" --> X1[(host reads removed)]
     B1 --> B2["bbduk: host rRNA"]
     B2 -- "drop host rRNA k-mer matches" --> X2[(rRNA removed)]
     B2 --> B3["bbduk: low-complexity (entropy)"]
     B3 -- "drop simple-repeat reads" --> X3[(low-complexity removed)]
-    B3 --> B4["clumpify: duplicates"]
-    B4 -- "collapse PCR/optical dups" --> X4[(duplicates removed)]
-    B4 --> C["Candidate-microbial reads<br/>(per-sample read accounting)"]
+    B3 --> B4["clumpify: PCR/exact duplicates"]
+    B4 -- "collapse exact duplicates" --> X4[(duplicates removed)]
+    B4 --> B5["bowtie2 &rarr; T2T-CHM13 (optional)"]
+    B5 -- "drop residual human GRCh38 missed" --> X5[(T2T host removed)]
+    B5 --> C["Candidate-microbial reads<br/>(per-sample read accounting)"]
 
-    C --> D{{"STEP 02 — Kraken2 (DNA)"}}
-    C --> E{{"STEP 04 — Kaiju (protein)"}}
+    C --> D{{"STEP 02 — Kraken2 (DNA)<br/>conf 0.1 + min-hit-groups 3<br/>+ minimizer data"}}
+    C --> E{{"STEP 04 — Kaiju (protein)<br/>greedy, -e 3"}}
 
-    D -- "confidence 0.1 + min-hit-groups 3<br/>(rest -> unclassified)" --> F{{"STEP 03 — Bracken<br/>species + genus"}}
-    E -- "greedy, -e 3" --> G{{"STEP 04b — kaiju2table"}}
+    D --> F{{"STEP 03 — Bracken (species + genus)<br/>+ distinct-minimizer table + QC"}}
+    E --> G{{"STEP 04b — kaiju2table"}}
 
-    F --> H{{"STEP 05 — merge + filter + cross-validate"}}
-    G --> H
+    F --> H{{"STEP 05 — merge + cross-validate"}}
+    G --> KF{"Kaiju pre-filter:<br/>&ge; KAIJU_MIN_READS &amp; non-human?"}
+    KF -- "no: sub-threshold / human" --> GZ[["kaiju_filtered_out.csv.gz<br/>(preserved, not discarded)"]]
+    KF -- "yes: meaningful Kaiju" --> H
 
-    H --> H1["remove human (Homo sapiens)"]
-    H1 --> H2["kitome blocklist (Salter 2014)"]
-    H2 --> H3["distinct-minimizer filter (KrakenUniq-style)"]
-    H3 --> H4["abundance + prevalence filters"]
-    H4 --> H5["Kraken2 &cap; Kaiju concordance"]
-    H5 --> I["HIGH-CONFIDENCE TAXA"]
+    H --> XV["Cross-validate Kraken2 vs MEANINGFUL Kaiju<br/>match by NCBI taxid OR genus-aware name"]
+    XV --> T1["both<br/>(Kraken2 &amp; meaningful Kaiju)"]
+    XV --> T2["kraken2_only<br/>(incl. rRNA bacteria Kaiju can't see)"]
+    XV --> T3["kaiju_only<br/>(meaningful Kaiju, Kraken2 missed)"]
 
-    I --> J{{"STEP 06 — figures + pipeline_summary.txt"}}
+    T1 --> CV[["cross_validated_species.csv<br/>EVERY surviving call, 3-way labelled;<br/>contaminants FLAGGED, not dropped"]]
+    T2 --> CV
+    T3 --> CV
+
+    CV --> G1["gate: not human (Homo sapiens)"]
+    G1 --> G2["gate: not kitome blocklist<br/>(Salter 2014 + Eisenhofer/Poore; flag &amp; exclude)"]
+    G2 --> G3["gate: distinct-minimizer (KrakenUniq-style)"]
+    G3 --> G4["gate: abundance + prevalence"]
+    G4 --> G5["gate: Kraken2 &cap; Kaiju concordance<br/>(REQUIRE_BOTH = true &rarr; keep 'both')"]
+    G5 --> HC[["high_confidence_taxa.csv<br/>+ cohort_high_confidence_summary.csv"]]
+    CV -. "failed &ge; 1 gate (with fail_reason)" .-> REJ[["rejected_calls.csv.gz"]]
+
+    HC --> J{{"STEP 06 — figures + pipeline_summary.txt"}}
+    CV --> J
+
+    %% optional decontam hook (only if negative controls supplied)
+    CTRL["negative controls (optional)"] -. "decontam prevalence" .-> G2
 
     classDef step fill:#1F3864,stroke:#1F3864,color:#fff;
     classDef drop fill:#F4CCCC,stroke:#B22222,color:#333;
     classDef out fill:#D5E8D4,stroke:#2E7D32,color:#1b1b1b;
+    classDef file fill:#FFF2CC,stroke:#BF9000,color:#1b1b1b;
+    classDef split fill:#E1D5E7,stroke:#7B5EA7,color:#1b1b1b;
+    classDef gate fill:#DAE8FC,stroke:#2F5597,color:#1b1b1b;
     class B,D,E,F,G,H,J step;
-    class X1,X2,X3,X4 drop;
-    class C,I out;
+    class X1,X2,X3,X4,X5 drop;
+    class C out;
+    class CV,HC,GZ,REJ file;
+    class XV,T1,T2,T3,KF split;
+    class G1,G2,G3,G4,G5 gate;

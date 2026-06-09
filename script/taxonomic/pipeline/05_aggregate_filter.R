@@ -11,6 +11,7 @@
 #  7 BLOCKLIST            8 MIN_READS               9 MIN_RPM
 # 10 MIN_PREVALENCE_FRAC 11 MIN_MINIMIZER_COVERAGE 12 MIN_DISTINCT_MINIMIZERS
 # 13 REQUIRE_BOTH        14 CONTROLS_LIST (path or "NONE")
+# 15 KAIJU_MIN_READS     (optional; Kaiju read floor for cross-validation; default = MIN_READS)
 # =============================================================================
 suppressPackageStartupMessages({
   # explicit core packages (not the tidyverse meta-package)
@@ -27,6 +28,8 @@ MIN_READS <- as.numeric(a[8]); MIN_RPM <- as.numeric(a[9])
 MIN_PREV <- as.numeric(a[10]); MIN_COV <- as.numeric(a[11])
 MIN_DISTINCT <- as.numeric(a[12]); REQUIRE_BOTH <- tolower(a[13]) == "true"
 CONTROLS <- a[14]
+# Separate Kaiju read floor (lower than MIN_READS by design); back-compat default.
+KAIJU_MIN_READS <- if (length(a) >= 15 && nzchar(a[15])) as.numeric(a[15]) else MIN_READS
 
 dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
 log <- function(...) cat(format(Sys.time(), "[%H:%M:%S] "), ..., "\n", sep = "")
@@ -48,6 +51,18 @@ clean_sample <- function(x) {
 clean_tax <- function(x) x %>% str_remove_all("^[a-z]__") %>%
   str_replace_all(";", "") %>% str_trim()
 norm_name <- function(x) x %>% tolower() %>% str_trim()
+# Genus-qualified species key so bare epithets (e.g. "pneumoniae") cannot
+# false-match across genera (Klebsiella vs Streptococcus pneumoniae). NA-safe.
+sp_key_of  <- function(g, s) {
+  g <- ifelse(is.na(g), "", g); s <- ifelse(is.na(s), "", s)
+  norm_name(paste(g, s))
+}
+# Human-readable label: prepend genus when the species field is a bare epithet
+# (no space), else keep the existing binomial. NA-safe.
+sp_display <- function(g, s) {
+  g <- ifelse(is.na(g), "", g); s <- ifelse(is.na(s), "", s)
+  ifelse(str_detect(s, "\\s"), str_trim(s), str_trim(paste(g, s)))
+}
 
 # ---- 1. Kraken2/Bracken (species) from BIOM ---------------------------------
 log("Loading Bracken BIOM:", BIOM)
@@ -92,7 +107,12 @@ if (file.exists(MMZ)) {
                          by = c("sample","taxid"))
   kb <- kb %>% mutate(
     distinct_minimizers = ifelse(is.na(distinct_minimizers), NA_real_, distinct_minimizers),
-    pass_minimizer = is.na(distinct_minimizers) |
+    # "fail-open" = no minimizer row at all. Bracken redistributes reads to species
+    # the raw Kraken2 report never assigned directly, so they carry no distinct-
+    # minimizer evidence and clear this gate by default. Track it so we can report
+    # how often the KrakenUniq-style guard is actually screening anything.
+    minimizer_failopen = is.na(distinct_minimizers),
+    pass_minimizer = minimizer_failopen |
       (distinct_minimizers >= MIN_DISTINCT & coverage >= MIN_COV))
   n_na_mmz <- sum(is.na(kb$distinct_minimizers))
   log("Applied minimizer filter (distinct>=", MIN_DISTINCT, ", coverage>=", MIN_COV, ")")
@@ -100,7 +120,8 @@ if (file.exists(MMZ)) {
     log("NOTE:", n_na_mmz, "taxon-calls had no minimizer row and auto-passed (fail-open);",
         "verify step 02 wrote a *.kreport.minimizer for every sample.")
 } else {
-  kb <- kb %>% mutate(distinct_minimizers = NA_real_, coverage = NA_real_, pass_minimizer = TRUE)
+  kb <- kb %>% mutate(distinct_minimizers = NA_real_, coverage = NA_real_,
+                      minimizer_failopen = TRUE, pass_minimizer = TRUE)
   log("WARN: no minimizer_stats.tsv; skipping KrakenUniq-style filter.")
 }
 
@@ -132,6 +153,34 @@ kj <- tryCatch({
     summarise(kaiju_reads = sum(reads), .groups = "drop")
 }, error = function(e) { log("WARN: could not read Kaiju matrix:", conditionMessage(e)); NULL })
 
+# ---- 5b. Filter Kaiju BEFORE cross-validation -------------------------------
+# Kaiju (greedy nr_euk) emits a huge low-read tail with no upstream floor, unlike
+# Kraken2 (pre-filtered by --confidence/--minimum-hit-groups and Bracken's
+# BRACKEN_THRESH). Apply the same ">= MIN_READS, non-human" floor HERE so only
+# meaningful Kaiju calls enter cross-validation: a Kraken2 taxon is then "both"
+# only if a MEANINGFUL Kaiju call corroborates it -- not a single stray read.
+# The filtered-out tail (sub-threshold or human) is preserved in a separate gz.
+n_kaiju_filtered_out <- 0L
+kj_meaningful        <- NULL
+if (!is.null(kj) && nrow(kj) > 0) {
+  kj <- kj %>% mutate(
+    species_label  = sp_display(genus, species),
+    is_host        = is_host(genus, species),
+    is_blocklisted = norm_name(genus) %in% block | norm_name(species) %in% block,
+    pass_abundance = kaiju_reads >= KAIJU_MIN_READS)
+  meaningful_mask <- dplyr::coalesce(kj$pass_abundance & !kj$is_host, FALSE)
+  kj_meaningful   <- kj %>% filter(meaningful_mask)
+  kj_filtered_out <- kj %>% filter(!meaningful_mask)
+  n_kaiju_filtered_out <- nrow(kj_filtered_out)
+  if (n_kaiju_filtered_out > 0)
+    write_csv(kj_filtered_out %>% select(sample, taxid, superkingdom, phylum, class,
+                order, family, genus, species, species_label, kaiju_reads,
+                pass_abundance, is_host, is_blocklisted),
+              file.path(RESULTS_DIR, "kaiju_filtered_out.csv.gz"))
+  log("Kaiju pre-filter -- meaningful (>=", KAIJU_MIN_READS, "reads, non-human):", nrow(kj_meaningful),
+      " filtered-out:", n_kaiju_filtered_out, "(-> kaiju_filtered_out.csv.gz)")
+}
+
 # ---- 6. Cross-validate Kraken2 vs Kaiju -------------------------------------
 # Match on NCBI taxid (robust) OR normalized species name (covers taxonomy-
 # version skew between the Kraken2 and Kaiju DBs). A call is concordant ("both")
@@ -139,14 +188,17 @@ kj <- tryCatch({
 # whenever the two DBs spelled a species differently, or Kaiju emitted a
 # truncated lineage that pushed the species name out of the last field.
 kb2 <- kb %>%
-  mutate(sp_key = norm_name(species), ge_key = norm_name(genus)) %>%
-  filter(sp_key != "", sp_key != "na")
+  mutate(sp_key = sp_key_of(genus, species), ge_key = norm_name(genus),
+         species_label = sp_display(genus, species)) %>%
+  # gate on the SPECIES (not the now genus-qualified sp_key) so genus-only rows
+  # with an empty species are still dropped, as before.
+  filter(!is.na(species), norm_name(species) != "", norm_name(species) != "na")
 
-if (!is.null(kj) && nrow(kj) > 0) {
-  kj_name <- kj %>% mutate(sp_key = norm_name(species)) %>%
+if (!is.null(kj_meaningful) && nrow(kj_meaningful) > 0) {
+  kj_name <- kj_meaningful %>% mutate(sp_key = sp_key_of(genus, species)) %>%
     filter(sp_key != "", sp_key != "na") %>%
     group_by(sample, sp_key) %>% summarise(kaiju_reads_name = sum(kaiju_reads), .groups = "drop")
-  kj_taxid <- kj %>% filter(!is.na(taxid), taxid != "", taxid != "NA") %>%
+  kj_taxid <- kj_meaningful %>% filter(!is.na(taxid), taxid != "", taxid != "NA") %>%
     group_by(sample, taxid) %>% summarise(kaiju_reads_taxid = sum(kaiju_reads), .groups = "drop")
   xval <- kb2 %>%
     left_join(kj_name,  by = c("sample","sp_key")) %>%
@@ -158,7 +210,7 @@ if (!is.null(kj) && nrow(kj) > 0) {
     select(-kaiju_reads_name, -kaiju_reads_taxid)
 } else {
   xval <- kb2 %>% mutate(kaiju_reads = 0, detected_by = "kraken2_only")
-  log("WARN: no Kaiju data; all calls flagged kraken2_only.")
+  log("WARN: no meaningful Kaiju data; all Kraken2 calls flagged kraken2_only.")
 }
 
 # prevalence across samples (Kraken2 detections)
@@ -183,10 +235,13 @@ xval <- xval %>% mutate(
 
 # ---- 7. Optional decontam against negative controls -------------------------
 decontam_tab <- NULL
+contam_ids   <- character(0)   # decontam-flagged taxids; applied after 7b to ALL rows
 if (CONTROLS != "NONE" && file.exists(CONTROLS) && requireNamespace("decontam", quietly = TRUE)) {
   log("Running decontam (prevalence) against controls in:", CONTROLS)
   ctl <- read_tsv(CONTROLS, col_names = c("sample","type"), show_col_types = FALSE) %>%
     mutate(sample = clean_sample(sample))
+  # Build the prevalence matrix from the Kraken2/Bracken read counts only (xval
+  # has no Kaiju-only rows yet -- those are appended in 7b and have no `reads`).
   mat <- xval %>% group_by(sample, taxid) %>% summarise(reads = sum(reads), .groups="drop") %>%
     pivot_wider(names_from = sample, values_from = reads, values_fill = 0) %>%
     column_to_rownames("taxid") %>% as.matrix()
@@ -196,8 +251,6 @@ if (CONTROLS != "NONE" && file.exists(CONTROLS) && requireNamespace("decontam", 
     dc <- decontam::isContaminant(t(mat[, smp, drop=FALSE]), neg = is_ctrl, method = "prevalence")
     decontam_tab <- dc %>% rownames_to_column("taxid")
     contam_ids <- decontam_tab %>% filter(contaminant) %>% pull(taxid)
-    xval <- xval %>% mutate(is_decontam_contaminant = taxid %in% contam_ids,
-                            high_confidence = high_confidence & !is_decontam_contaminant)
     write_csv(decontam_tab, file.path(RESULTS_DIR, "decontam_contaminants.csv"))
     log("decontam flagged", length(contam_ids), "contaminant taxa.")
   } else log("WARN: controls list lacks usable control samples; skipping decontam.")
@@ -205,17 +258,15 @@ if (CONTROLS != "NONE" && file.exists(CONTROLS) && requireNamespace("decontam", 
   log("NOTE: decontam not run (no controls file or 'decontam' package missing).")
 }
 
-# ---- 7b. Kaiju-only taxa (detected by Kaiju, NOT by Kraken2/Bracken) --------
-# Append them as their own rows so cross_validated_species.csv shows the full
-# kraken2_only / kaiju_only / both breakdown. Kraken2/Bracken-derived metrics
-# (reads, RPM, percent, minimizers, prevalence) are NA by definition; abundance
-# and host/blocklist flags use the Kaiju read count. A Kaiju-only call is
-# high-confidence ONLY under REQUIRE_BOTH=false (it can never be "both" and has
-# no Kraken2 FP gates), so with the default REQUIRE_BOTH=true these appear in the
-# cross-validated table but never in high_confidence_taxa.csv.
+# ---- 7b. Kaiju-only taxa (meaningful Kaiju calls Kraken2/Bracken did not make) ---
+# kj_meaningful was already filtered (>= MIN_READS, non-human) in 5b, so every
+# Kaiju-only call here is meaningful and is appended to cross_validated_species.csv
+# (kitome contaminants kept + flagged, not dropped). Kraken2/Bracken-derived
+# metrics are NA; high-confidence only under REQUIRE_BOTH=false. is_host /
+# is_blocklisted / pass_abundance / species_label were already set in 5b.
 n_kaiju_only <- 0L
-if (!is.null(kj) && nrow(kj) > 0) {
-  kj_sp <- kj %>% mutate(sp_key = norm_name(species), ge_key = norm_name(genus)) %>%
+if (!is.null(kj_meaningful) && nrow(kj_meaningful) > 0) {
+  kj_sp <- kj_meaningful %>% mutate(sp_key = sp_key_of(genus, species), ge_key = norm_name(genus)) %>%
     filter(sp_key != "", sp_key != "na")
   kaiju_only <- kj_sp %>%
     anti_join(distinct(kb2, sample, sp_key), by = c("sample","sp_key")) %>%
@@ -224,9 +275,7 @@ if (!is.null(kj) && nrow(kj) > 0) {
       reads = NA_real_, classified_reads = NA_real_, total_reads = NA_real_,
       RPM = NA_real_, percent = NA_real_,
       distinct_minimizers = NA_real_, coverage = NA_real_, pass_minimizer = NA,
-      is_host        = is_host(genus, species),
-      is_blocklisted = norm_name(genus) %in% block | norm_name(species) %in% block,
-      pass_abundance = kaiju_reads >= MIN_READS,
+      minimizer_failopen = NA,
       n_samples = NA_integer_, pass_prevalence = NA,
       detected_by = "kaiju_only",
       high_confidence = if (REQUIRE_BOTH) FALSE
@@ -237,7 +286,14 @@ if (!is.null(kj) && nrow(kj) > 0) {
 }
 log("Classifier breakdown -- both:", sum(xval$detected_by == "both"),
     " kraken2_only:", sum(xval$detected_by == "kraken2_only"),
-    " kaiju_only:", n_kaiju_only)
+    " kaiju_only (meaningful):", n_kaiju_only,
+    " kaiju filtered-out:", n_kaiju_filtered_out)
+
+# Apply the decontam exclusion to ALL rows (Kraken2 + kept Kaiju-only), now that
+# the Kaiju-only rows are appended. No-op when decontam did not run (contam_ids
+# is empty -> taxid %in% character(0) is all FALSE).
+xval <- xval %>% mutate(is_decontam_contaminant = taxid %in% contam_ids,
+                        high_confidence = high_confidence & !is_decontam_contaminant)
 
 # Kraken2/Bracken-backbone view (excludes the appended Kaiju-only rows). The
 # filter funnel and the prevalence cascade below describe the Kraken2 path only.
@@ -245,29 +301,55 @@ xk <- xval %>% filter(detected_by != "kaiju_only")
 
 # ---- 8. Write outputs -------------------------------------------------------
 out_cols <- c("sample","taxid","superkingdom","phylum","class","order","family",
-              "genus","species","reads","kaiju_reads","total_reads","RPM","percent",
-              "distinct_minimizers","coverage","n_samples","detected_by",
+              "genus","species","species_label","reads","kaiju_reads","total_reads","RPM","percent",
+              "distinct_minimizers","coverage","minimizer_failopen","n_samples","detected_by",
               "is_host","is_blocklisted","pass_minimizer","pass_abundance",
               "pass_prevalence","high_confidence")
 out_cols <- intersect(out_cols, names(xval))
 write_csv(xval %>% select(all_of(out_cols)),
           file.path(RESULTS_DIR, "cross_validated_species.csv"))
+# (The filtered-out Kaiju tail was already written to kaiju_filtered_out.csv.gz
+#  in step 5b, before cross-validation.)
 
 hc <- xval %>% filter(high_confidence)
 write_csv(hc %>% select(all_of(out_cols)),
           file.path(RESULTS_DIR, "high_confidence_taxa.csv"))
 
+# Calls that did NOT pass every high-confidence gate (the complement of
+# high_confidence within cross_validated). `fail_reason` names which gate(s) each
+# call failed, so the table is filterable (e.g. ignore 'no_classifier_concordance'
+# to see only quality-gate failures). gzipped because the kaiju_only set is large.
+rejected <- xval %>% filter(!high_confidence) %>%
+  mutate(fail_reason = str_remove(paste0(
+    ifelse(is_host, "host;", ""),
+    ifelse(is_blocklisted, "kitome_contaminant;", ""),
+    ifelse(REQUIRE_BOTH & detected_by != "both", "no_classifier_concordance;", ""),
+    ifelse(!dplyr::coalesce(pass_abundance,  FALSE), "low_abundance;", ""),
+    ifelse(!dplyr::coalesce(pass_minimizer,  TRUE),  "low_distinct_minimizers;", ""),
+    ifelse(!dplyr::coalesce(pass_prevalence, TRUE),  "low_prevalence;", ""),
+    ifelse( dplyr::coalesce(is_decontam_contaminant, FALSE), "decontam_contaminant;", "")),
+    ";$"))
+write_csv(rejected %>% select(any_of(c(out_cols, "fail_reason"))),
+          file.path(RESULTS_DIR, "rejected_calls.csv.gz"))
+log("Wrote", nrow(rejected), "calls that failed >=1 gate to rejected_calls.csv.gz")
+
 # RPM is Kraken2/Bracken-derived (NA for any kaiju_only member of a group), so
 # aggregate it NA-safely; kaiju_reads carries the orthogonal Kaiju support.
 rpm_agg <- function(f, x) if (all(is.na(x))) NA_real_ else f(x[!is.na(x)])
-cohort <- hc %>% group_by(superkingdom, genus, species) %>%
-  summarise(n_samples = n_distinct(sample),
+# Group on species_label (genus + de-doubled species), which is consistent
+# whether a source stored the bare epithet or the full binomial -- so the same
+# organism is not split into two cohort rows under REQUIRE_BOTH=false.
+cohort <- hc %>% group_by(superkingdom, genus, species_label) %>%
+  summarise(species = dplyr::first(species),
+            n_samples = n_distinct(sample),
             mean_RPM   = rpm_agg(mean, RPM),
             median_RPM = rpm_agg(stats::median, RPM),
             max_RPM    = rpm_agg(max, RPM),
             kaiju_reads = sum(kaiju_reads, na.rm = TRUE),
             detected_by = paste(sort(unique(detected_by)), collapse=","),
-            .groups = "drop") %>% arrange(desc(n_samples), desc(mean_RPM))
+            .groups = "drop") %>%
+  relocate(species, .after = genus) %>%
+  arrange(desc(n_samples), desc(mean_RPM))
 write_csv(cohort, file.path(RESULTS_DIR, "cohort_high_confidence_summary.csv"))
 
 # --- Filter funnel: how many sample-taxon calls survive each successive gate ---
@@ -281,6 +363,14 @@ g_prev  <- g_abund & xk$pass_prevalence
 # is on, so the funnel stays monotonic (calls_dropped_here never goes negative).
 g_both  <- if (REQUIRE_BOTH) g_prev & (xk$detected_by == "both") else g_prev
 hc_k <- xk %>% filter(high_confidence)   # Kraken2-backbone high-confidence (funnel endpoint)
+# How often did the distinct-minimizer guard actually bite among the FINAL calls?
+# A high fail-open share means most high-confidence species had no minimizer row
+# (Bracken-redistributed) and the KrakenUniq-style gate never screened them --
+# worth knowing before trusting it as an FP control.
+n_hc_k        <- nrow(hc_k)
+n_hc_failopen <- sum(hc_k$minimizer_failopen, na.rm = TRUE)
+log(sprintf("Minimizer gate among high-confidence (Kraken2 backbone): %d/%d on real distinct-minimizer evidence, %d fail-open (no minimizer row).",
+            n_hc_k - n_hc_failopen, n_hc_k, n_hc_failopen))
 funnel <- tibble(
   stage = c("0. raw sample-taxon calls (Kraken2/Bracken)",
             "1. after host (Homo sapiens) removal",
@@ -348,7 +438,7 @@ wl("NLPHL tumor-microbiome pipeline — run summary")
 wl("=============================================")
 wl("Samples analyzed: ", n_samp)
 wl("")
-wl("READ FUNNEL  (median % of input read pairs per sample):")
+wl("READ FUNNEL  (median %, each stage relative to the reads ENTERING that stage):")
 if (exists("qc") && !is.null(qc)) {
   wl(sprintf("  host removed (STAR) ........ %s%%", med(qc$pct_host_STAR)))
   wl(sprintf("  rRNA removed ............... %s%%", med(qc$pct_rRNA_removed)))
@@ -363,20 +453,25 @@ wl("")
 wl("TAXON-CALL FUNNEL  (Kraken2/Bracken backbone; one call = one species in one sample):")
 for (i in seq_len(nrow(funnel)))
   wl(sprintf("  %-46s calls=%-7d species=%d", funnel$stage[i], funnel$calls[i], funnel$distinct_species[i]))
+wl(sprintf("  minimizer gate among high-confidence: %d/%d on real distinct-minimizer evidence, %d fail-open (Bracken-redistributed, no minimizer row)",
+           n_hc_k - n_hc_failopen, n_hc_k, n_hc_failopen))
 wl("")
-wl("CLASSIFIER BREAKDOWN  (all candidate calls, before high-confidence filtering):")
-wl(sprintf("  both (Kraken2 & Kaiju) ..... %d", sum(xval$detected_by == "both")))
-wl(sprintf("  Kraken2 only ............... %d", sum(xval$detected_by == "kraken2_only")))
-wl(sprintf("  Kaiju only ................. %d", sum(xval$detected_by == "kaiju_only")))
+wl(sprintf("CLASSIFIER BREAKDOWN  (Kaiju pre-filtered to >= %d reads & non-human before cross-validation):", KAIJU_MIN_READS))
+wl(sprintf("  both (Kraken2 & meaningful Kaiju)  %d", sum(xk$detected_by == "both")))
+wl(sprintf("  Kraken2 only ...................... %d", sum(xk$detected_by == "kraken2_only")))
+wl(sprintf("  Kaiju only (meaningful) ........... %d", n_kaiju_only))
+wl(sprintf("  Kaiju filtered out (sidelined) .... %d  (-> kaiju_filtered_out.csv.gz)", n_kaiju_filtered_out))
 wl("")
 wl("TOP HIGH-CONFIDENCE SPECIES (by prevalence):")
 top <- utils::head(cohort, 15)
 if (nrow(top) > 0) for (i in seq_len(nrow(top)))
-  wl(sprintf("  %2d. %-32s %d/%d samples  median RPM %.1f  [%s]",
-             i, top$species[i], top$n_samples[i], n_samp, top$median_RPM[i], top$detected_by[i]))
+  wl(sprintf("  %2d. %-34s %d/%d samples  median RPM %.1f  [%s]",
+             i, top$species_label[i], top$n_samples[i], n_samp, top$median_RPM[i], top$detected_by[i]))
 wl("")
 wl("Key files: high_confidence_taxa.csv | cohort_high_confidence_summary.csv |")
-wl("           cross_validated_species.csv | QC_read_accounting.csv | filter_funnel_summary.csv")
+wl("           cross_validated_species.csv | QC_read_accounting.csv | filter_funnel_summary.csv |")
+wl("           rejected_calls.csv.gz (failed >=1 gate, with fail_reason) |")
+wl("           kaiju_filtered_out.csv.gz (Kaiju below KAIJU_MIN_READS or human, pre-cross-validation)")
 close(con)
 
 log("Done. Wrote results to:", RESULTS_DIR)
