@@ -21,6 +21,16 @@ mkdir -p logs
 MAXC="${1:-8}"
 KAIJU_MAXC=2   # Kaiju loads ~187 GB DB per task -> keep concurrency low
 
+# Show the active cohort up front -- this pipeline is reusable across cohorts via
+# environment overrides (see config.sh), so confirm you are running the RIGHT one.
+echo "=============================================================="
+echo " Microbiome pipeline -- cohort settings"
+echo "   TRIM_DIR = $TRIM_DIR"
+echo "   RUN_DIR  = $RUN_DIR"
+echo "   MANIFEST = ${SAMPLE_MANIFEST:-(none -> glob $TRIM_DIR)}"
+echo "   REFS_DIR = $REFS_DIR"
+echo "=============================================================="
+
 # Pre-flight: verify modules/tools/DBs/inputs before submitting anything.
 # Bypass with RUN_ALL_SKIP_PREFLIGHT=1 if you have already checked.
 if [ "${RUN_ALL_SKIP_PREFLIGHT:-0}" != "1" ]; then

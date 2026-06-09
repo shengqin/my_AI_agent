@@ -17,21 +17,35 @@ export PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # ---------------------------------------------------------------------------
 # 1. COHORT INPUT / OUTPUT
 # ---------------------------------------------------------------------------
-export COHORT_DIR="/oak/stanford/groups/emoding/sequencing/pipeline/runs/rnaseq/Binkley_NLPHL"
+# --- COHORT SELECTION --------------------------------------------------------
+# Override these in the ENVIRONMENT to run a new cohort from a shared copy of this
+# pipeline WITHOUT editing this file, e.g.:
+#   TRIM_DIR=/oak/.../Binkley_cHL/cHL_fastp \
+#   RUN_DIR=/oak/.../Binkley_cHL/microbiome \
+#   SAMPLE_MANIFEST= \
+#   bash run_all.sh 8
+# Each value falls back to the NLPHL default when unset, so the original NLPHL run
+# still works with no environment variables. run_all.sh submits with
+# `sbatch --export=ALL`, so exported overrides reach every step at runtime.
+export COHORT_DIR="${COHORT_DIR:-/oak/stanford/groups/emoding/sequencing/pipeline/runs/rnaseq/Binkley_NLPHL}"
 
 # Demuxed + fastp-trimmed paired FASTQs (the same inputs used for STAR-RSEM / salmon).
-export TRIM_DIR="$COHORT_DIR/NovaSeq_trimmed"
+export TRIM_DIR="${TRIM_DIR:-$COHORT_DIR/NovaSeq_trimmed}"
 
 # All pipeline outputs are written under here.
-export RUN_DIR="$COHORT_DIR/microbiome"
-export LOG_DIR="$RUN_DIR/logs"
-export SAMPLE_LIST="$LOG_DIR/sample_list.tsv"
+export RUN_DIR="${RUN_DIR:-$COHORT_DIR/microbiome}"
+export LOG_DIR="${LOG_DIR:-$RUN_DIR/logs}"
+export SAMPLE_LIST="${SAMPLE_LIST:-$LOG_DIR/sample_list.tsv}"
 
 # Authoritative sample list. If set AND present, the sample sheet is built from
 # this manifest (one sample name per line; column 1) instead of globbing the
 # directory -- this matches the expression pipeline (bs_STAR_align.sh reads the
 # same file) and avoids stray/duplicate FASTQs in subfolders. Empty => glob.
-export SAMPLE_MANIFEST="$TRIM_DIR/LP_samples.txt"
+# The `-` (not `:-`) lets an explicit `SAMPLE_MANIFEST=` force globbing; an unset
+# value falls back to the NLPHL manifest. A manifest path that does not exist also
+# falls back to globbing (see 00_build_sample_sheet.sh), so a new cohort without a
+# manifest works either way.
+export SAMPLE_MANIFEST="${SAMPLE_MANIFEST-$TRIM_DIR/LP_samples.txt}"
 
 # Per-step output sub-directories.
 export D_HOST="$RUN_DIR/01_host_removed"      # candidate-microbial FASTQs + STAR logs
@@ -43,8 +57,8 @@ export D_FIGS="$RUN_DIR/06_figures"           # plots / PDFs
 
 # FASTQ naming. Trimmed files are R1_<sample>.trimmed.fastq.gz (lab convention).
 # The sample-sheet builder also tries a few common alternates automatically.
-export R1_TAG="R1_"
-export R1_SUFFIX=".trimmed.fastq.gz"
+export R1_TAG="${R1_TAG:-R1_}"
+export R1_SUFFIX="${R1_SUFFIX:-.trimmed.fastq.gz}"
 
 # ---------------------------------------------------------------------------
 # 2. COMPUTE (SLURM)
@@ -83,8 +97,12 @@ export BBMAP_BIN="/oak/stanford/groups/emoding/analysis/brian/conda_envs/bbmap/b
 #     traps residual human reads that GRCh38 misses.
 # Human-only rRNA reference for the step-01 rRNA scrub. Build it once with
 # build_human_rrna.sh (writes to this path). If absent, the rRNA sub-step skips.
-export HUMAN_RRNA_FASTA="$RUN_DIR/refs/human_rRNA.fa"
-export T2T_BT2_INDEX="$RUN_DIR/refs/chm13v2.0"   # build once with build_t2t_index.sh (B4 skips if absent)
+# Refs are cohort-INDEPENDENT: keep them in a shared REFS_DIR and reuse for every
+# cohort (build once, point every run here). Override REFS_DIR or either path in
+# the environment if your install lives elsewhere.
+export REFS_DIR="${REFS_DIR:-/oak/stanford/groups/emoding/analysis/brian/tools/microbiome/refs}"
+export HUMAN_RRNA_FASTA="${HUMAN_RRNA_FASTA:-$REFS_DIR/human_rRNA.fa}"
+export T2T_BT2_INDEX="${T2T_BT2_INDEX:-$REFS_DIR/chm13v2.0}"   # build once with build_t2t_index.sh (B4 skips if absent)
 export LOWCOMPLEXITY_ENTROPY="0.30"   # bbduk entropy filter (0 disables)
 export DEDUP="true"                    # clumpify exact-duplicate (PCR) removal if available
                                        # (optical dedup is NOT enabled; add optical=t dupedist=N
