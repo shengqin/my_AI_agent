@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 cd "$SCRIPT_DIR"
-mkdir -p logs
+mkdir -p "$LOG_DIR"   # per-cohort log dir (RUN_DIR/logs); SLURM .out/.err routed here via --chdir in submit()
 
 MAXC="${1:-8}"
 KAIJU_MAXC=2   # Kaiju loads ~187 GB DB per task -> keep concurrency low
@@ -49,7 +49,10 @@ echo ">>> $N samples"
 
 # Export PIPELINE_DIR so each job can find config.sh regardless of SLURM's
 # spool dir (sbatch copies the script, so ${BASH_SOURCE} won't point here).
-submit() { sbatch --export=ALL,PIPELINE_DIR="$SCRIPT_DIR" "$@" | awk '{print $NF}'; }
+# --chdir="$RUN_DIR" makes each .sbatch's relative `--output=logs/...` land in the
+# COHORT's $RUN_DIR/logs (not the shared pipeline dir) -- essential when one shared
+# tools copy runs multiple cohorts. $LOG_DIR is created above before any submit.
+submit() { sbatch --export=ALL,PIPELINE_DIR="$SCRIPT_DIR" --chdir="$RUN_DIR" "$@" | awk '{print $NF}'; }
 
 j01=$(submit --array=1-"$N"%"$MAXC" 01_host_removal.sbatch)
 echo "    01 host removal     : $j01"
