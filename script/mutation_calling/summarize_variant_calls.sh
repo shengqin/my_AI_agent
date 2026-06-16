@@ -166,9 +166,17 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         NORMAL_COL=$(echo "$header_line" | awk -F'\t' -v sm="$normal_sm" '{
             for(i=10;i<=NF;i++) if($i==sm){print i; exit}
         }')
-        # Fallback: if SM not found (e.g. patched names), assume col10=tumor, col11=normal
-        [[ -z "$TUMOR_COL" ]] && TUMOR_COL=10
-        [[ -z "$NORMAL_COL" ]] && NORMAL_COL=11
+        # Fallback: if SM not found (e.g. patched names), assume col10=tumor, col11=normal.
+        # If we HAD an authoritative SM (from the sidecar) but it isn't in the header, warn
+        # loudly — the positional fallback could otherwise silently swap tumor/normal metrics.
+        if [[ -z "$TUMOR_COL" ]]; then
+            [[ -n "$tumor_sm" ]] && echo "  WARNING: tumor SM '$tumor_sm' not found in $(basename "$vcf") header for $SAMPLE_NAME; falling back to col10." >&2
+            TUMOR_COL=10
+        fi
+        if [[ -z "$NORMAL_COL" ]]; then
+            [[ -n "$normal_sm" ]] && echo "  WARNING: normal SM '$normal_sm' not found in $(basename "$vcf") header for $SAMPLE_NAME; falling back to col11." >&2
+            NORMAL_COL=11
+        fi
         # Guard: tumor and normal MUST be distinct columns. If SM matching collapsed them
         # onto one column (identical/blank SM names), fall back to col10=tumor/col11=normal
         # so we never copy tumor metrics into the Normal_AF/Normal_DP fields.

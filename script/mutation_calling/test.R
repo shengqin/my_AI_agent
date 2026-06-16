@@ -479,28 +479,54 @@ sv_qc <- tibble(Sample = character(), Gene = character(), Mutation_Class = chara
 if (file.exists(SV_FILE)) {
   sv_data <- read_tsv(SV_FILE, show_col_types = FALSE)
 
+  # Keep only PASS structural variants. Manta flags low-confidence calls
+  # (e.g. MinSomaticScore); without this they would leak into the OncoPrint.
+  if ("Filter" %in% colnames(sv_data)) {
+    n_sv_before <- nrow(sv_data)
+    sv_data <- sv_data %>% filter(Filter == "PASS")
+    cat(sprintf("  SV PASS filter: %d -> %d structural variants\n", n_sv_before, nrow(sv_data)))
+  }
+
   if (nrow(sv_data) > 0) {
+    # Helper: panel genes overlapping a breakpoint window chr:[min(p1,p2)-flank, max(p1,p2)+flank]
+    genes_near <- function(chrom, p1, p2, flank = 50000) {
+      if (is.na(p1)) return(character(0))
+      if (is.na(p2)) p2 <- p1
+      gene_coords %>%
+        filter(
+          Chromosome == chrom,
+          Gene_Start <= max(p1, p2) + flank,
+          Gene_End   >= min(p1, p2) - flank
+        ) %>%
+        pull(Gene)
+    }
+
     # Map SV breakpoints to nearby panel genes
     sv_gene_hits <- list()
 
     for (i in seq_len(nrow(sv_data))) {
       sv <- sv_data[i, ]
-      sv_pos <- as.numeric(sv$Position)
-      sv_end <- as.numeric(sv$Mate_Pos)
-      if (is.na(sv_end)) sv_end <- sv_pos
+      sv_pos   <- as.numeric(sv$Position)
+      mate_pos <- as.numeric(sv$Mate_Pos)
+      mate_chr <- if ("Mate_Chrom" %in% colnames(sv_data)) sv$Mate_Chrom else NA_character_
 
-      # Find genes on the same chromosome near the breakpoint (within the SV span)
-      hits <- gene_coords %>%
-        filter(
-          Chromosome == sv$Chromosome,
-          Gene_Start <= max(sv_pos, sv_end) + 50000, # 50kb flanking
-          Gene_End >= min(sv_pos, sv_end) - 50000
-        )
+      if (!is.na(mate_chr) && mate_chr != "." && mate_chr != sv$Chromosome) {
+        # Interchromosomal (BND / translocation): map EACH breakpoint on its OWN
+        # chromosome with a focal window — do NOT span the gap across chromosomes
+        # (which would both miss the partner gene and create false hits on chr1).
+        hit_genes <- unique(c(
+          genes_near(sv$Chromosome, sv_pos,  sv_pos),
+          genes_near(mate_chr,      mate_pos, mate_pos)
+        ))
+      } else {
+        # Intrachromosomal (DEL/DUP/INV): map genes across the spanned region.
+        hit_genes <- genes_near(sv$Chromosome, sv_pos, mate_pos)
+      }
 
-      if (nrow(hits) > 0) {
+      if (length(hit_genes) > 0) {
         sv_gene_hits[[length(sv_gene_hits) + 1]] <- tibble(
           Sample = sv$Sample,
-          Gene = hits$Gene,
+          Gene = hit_genes,
           SV_Type = sv$SV_Type,
           Mutation_Class = paste0("SV_", sv$SV_Type)
         )
