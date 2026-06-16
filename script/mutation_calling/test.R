@@ -37,11 +37,13 @@ cat("Loading and processing variant data...\n")
 # 2. Read and QC SNV/Indel Data (Mutect2 + SnpEff)
 # ==============================================================================
 # Read data
-snv_data <- read_tsv(MUTECT_FILE, show_col_types = FALSE)
+snv_data <- read_tsv(MUTECT_FILE, col_types = cols(Tumor_F1R2 = col_character(), Tumor_F2R1 = col_character(), Tumor_AF = col_character(), Normal_AF = col_character(), Tumor_AD_Alt = col_character(), Tumor_AD_Ref = col_character()), show_col_types = FALSE)
 
 # QC Filter 1: Only keep high-confidence PASS variants
 snv_filt <- snv_data %>%
-  filter(Filter == "PASS")
+  filter(Filter == "PASS") %>%
+  # Remove known false positive / artifactual genes
+  filter(!Gene %in% c("ACTB", "IGLL5", "ABO", "MPEG1", "ELK2AP", "ELK2AP-MIR4507", "MIR8071-1-ELK2AP"))
 
 # QC Filter 2: Enforce the CAPP-Seq Published Strict Heuristics
 snv_filt <- snv_filt %>%
@@ -362,12 +364,22 @@ if (file.exists(CNVKIT_FILE)) {
     cnv_seg_data <- cnv_seg_data %>%
       filter(!Chromosome %in% c("chrX", "chrY"))
 
-    # 2. Exclude IGH locus region (chr14:35.8M-69.3M): V(D)J recombination in
-    #    B-cell lineage causes apparent copy loss — germline/lineage artifact.
-    #    Use interval-OVERLAP logic so that large arm-level segments that merely
-    #    overlap the IGH window are also excluded (not only fully-contained ones).
+    # 2. Exclude Immunoglobulin (Ig) Loci: V(D)J recombination in B-cell
+    #    lineage causes apparent copy loss/gains — germline/lineage artifact
     cnv_seg_data <- cnv_seg_data %>%
-      filter(!(Chromosome == "chr14" & Start < 70000000 & End > 35000000))
+      filter(!(
+        # IGH locus (chr14:105.8M-107.3M)
+        (Chromosome == "chr14" & Start <= 108000000 & End >= 105000000) |
+        # IGK locus (chr2:88.8M-90.3M)
+        (Chromosome == "chr2" & Start <= 91000000 & End >= 88000000) |
+        # IGL locus (chr22:22M-23.5M)
+        (Chromosome == "chr22" & Start <= 24000000 & End >= 21000000)
+      ))
+
+    # 2b. Exclude ACTB pseudogene mapping artifact region (chr7:5.56M-5.57M)
+    #    Highly fragmented cfDNA mis-maps to pseudogenes, appearing as a focal deletion
+    cnv_seg_data <- cnv_seg_data %>%
+      filter(!(Chromosome == "chr7" & Start <= 5600000 & End >= 5500000))
 
     # 3. Require minimum probe support: segments driven by 1-4 probes are
     #    highly prone to technical noise in targeted panels
@@ -497,7 +509,7 @@ if (file.exists(SV_FILE)) {
 
     if (length(sv_gene_hits) > 0) {
       sv_qc <- bind_rows(sv_gene_hits) %>%
-        filter(!str_detect(Gene, "^LINC|^LOC|^MIR\\d|^OR\\d|-AS\\d")) %>%
+        filter(!str_detect(Gene, "^LINC|^LOC|^MIR\\d|^OR\\d|-AS\\d|ACTB|IGLL5|ABO|MPEG1|ELK2AP")) %>%
         select(Sample, Gene, Mutation_Class) %>%
         distinct()
 
@@ -594,7 +606,7 @@ col <- c(
   "UTR_SNV"          = "#F39C12", # Gold/Amber
   "Other_SNV"        = "#7F8C8D", # Gray
   # Indel types
-  "Frameshift_Indel" = "#000000", # Black (truncating, same as nonsense per cBioPortal)
+  "Frameshift_Indel" = "#2C3E50", # Dark Navy Blue (differentiated from Nonsense)
   "Inframe_Indel"    = "#993404", # Brown (cBioPortal standard)
   # CNV types (cBioPortal convention: red for amp, blue for del)
   "Amplification"    = "#FF0000", # Red (cBioPortal standard)
@@ -629,7 +641,7 @@ alter_fun <- list(
   },
   # --- Indel types: slightly shorter (cBioPortal uses ~2/3 height for inframe) ---
   "Frameshift_Indel" = function(x, y, w, h) {
-    grid.rect(x, y, w - unit(0.5, "pt"), h - unit(0.5, "pt"), gp = gpar(fill = col["Frameshift_Indel"], col = NA))
+    grid.rect(x, y, w - unit(0.5, "pt"), h * 0.66, gp = gpar(fill = col["Frameshift_Indel"], col = NA))
   },
   "Inframe_Indel" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h * 0.66, gp = gpar(fill = col["Inframe_Indel"], col = NA))
