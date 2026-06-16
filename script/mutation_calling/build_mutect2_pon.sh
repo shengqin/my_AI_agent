@@ -104,9 +104,10 @@ while IFS=$'\t' read -r NORMAL_NAME _REST || [[ -n "$NORMAL_NAME" ]]; do
 
     echo "  Processing: $NORMAL_NAME"
 
-    # Extract SM tag; patch if missing (same logic as main pipeline)
+    # Extract SM tag; patch if missing (same logic as main pipeline).
+    # Tab-aware awk parse (portable) instead of `sed 's/...[^\t]*.../'`.
     set +o pipefail
-    SM_TAG=$(samtools view -H "$BAM_PATH" | grep -m1 '^@RG' | sed 's/.*SM:\([^\t]*\).*/\1/')
+    SM_TAG=$(samtools view -H "$BAM_PATH" | awk -F'\t' '$1=="@RG"{for(i=1;i<=NF;i++) if($i ~ /^SM:/){sub(/^SM:/,"",$i); print $i; exit}}')
     set -o pipefail
 
     ACTUAL_BAM="$BAM_PATH"
@@ -191,9 +192,15 @@ PON_RAW="$OUTPUT_DIR/pon_raw_variants.tmp"
 
 for vcf in "$NORMAL_VCFS_DIR"/*.vcf.gz; do
     [[ "$vcf" == *"_rg_patched"* ]] && continue
-    # Extract all variant sites and their AF (unfiltered — we want everything)
-    # bcftools query extracts FORMAT/AF for the single sample
-    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' "$vcf" 2>/dev/null >> "$PON_RAW" || true
+    # Extract all variant sites and their AF (unfiltered — we want everything).
+    # IMPORTANT: split multiallelic records first (bcftools norm -m -any) so each row is a
+    # single ALT with a scalar AF. The tumor calls are normalized the same way before
+    # annotation (mutation_calling_from_bam.sh), so the per-site PoN keys (CHROM/POS/REF/ALT)
+    # match the tumor variant keys joined in test.R. Without this, a multiallelic normal site
+    # keyed "ALT=C,G" would never match a normalized tumor "ALT=C", silently weakening the
+    # PoN frequency filter at multiallelic sites.
+    bcftools norm -m -any -f "$REF_GENOME" "$vcf" 2>/dev/null \
+        | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' 2>/dev/null >> "$PON_RAW" || true
 done
 
 # Sort and aggregate: count samples per site, track max AF
