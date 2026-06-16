@@ -30,6 +30,23 @@ else
     ZCAT="zcat"
 fi
 
+# find_one <dir> <find-args...>: print the single matching path, or nothing if none.
+# Warns (to stderr) and prints the FIRST match if more than one file matches, so a stale
+# duplicate in a results dir is surfaced rather than silently/arbitrarily chosen by `head`.
+find_one() {
+    local _dir="$1"; shift
+    # Guard a missing directory (and tolerate find's non-zero exit) so this stays safe under
+    # `set -eu` without pipefail — matching the old `find ... | head -n1` behavior.
+    [[ -d "$_dir" ]] || return 0
+    local _matches _n
+    _matches=$(find "$_dir" "$@" 2>/dev/null || true)
+    _n=$(printf '%s' "$_matches" | grep -c . || true)
+    if [[ "$_n" -gt 1 ]]; then
+        echo "  WARNING: expected one file in $_dir for [$*] but found $_n; using the first." >&2
+    fi
+    printf '%s\n' "$_matches" | head -n 1
+}
+
 # Input validation
 if [[ "$#" -lt 2 ]]; then
     echo "Usage: ./summarize_variant_calls.sh <output_dir> <results_dir1> [results_dir2] ..."
@@ -50,6 +67,20 @@ for DIR in "${RESULTS_DIRS[@]}"; do
 done
 
 mkdir -p "$OUTPUT_DIR"
+
+# Stage the Mutect2 PoN per-site frequency summary into the combined-summary dir so the
+# downstream R script (test.R) can find it as <OUTPUT_DIR>/pon_site_summary.tsv. Without
+# this, test.R's PON_SUMMARY_FILE never exists and the CAPP-Seq PoN frequency filter is
+# silently skipped. Path is supplied via the PON_SITE_SUMMARY env var (set by run_full_pipeline.sh).
+if [[ -n "${PON_SITE_SUMMARY:-}" ]]; then
+    if [[ -f "$PON_SITE_SUMMARY" ]]; then
+        cp "$PON_SITE_SUMMARY" "$OUTPUT_DIR/pon_site_summary.tsv"
+        echo "Staged PoN site summary -> $OUTPUT_DIR/pon_site_summary.tsv"
+    else
+        echo "WARNING: PON_SITE_SUMMARY set but file not found: $PON_SITE_SUMMARY"
+        echo "         test.R will SKIP the PoN frequency filter."
+    fi
+fi
 
 # Output files
 SUMMARY_CSV="$OUTPUT_DIR/cohort_variant_summary.csv"
@@ -138,14 +169,30 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         # Fallback: if SM not found (e.g. patched names), assume col10=tumor, col11=normal
         [[ -z "$TUMOR_COL" ]] && TUMOR_COL=10
         [[ -z "$NORMAL_COL" ]] && NORMAL_COL=11
+        # Guard: tumor and normal MUST be distinct columns. If SM matching collapsed them
+        # onto one column (identical/blank SM names), fall back to col10=tumor/col11=normal
+        # so we never copy tumor metrics into the Normal_AF/Normal_DP fields.
+        if [[ "$TUMOR_COL" == "$NORMAL_COL" ]]; then
+            echo "  WARNING: tumor/normal VCF columns both resolved to col${TUMOR_COL} for $SAMPLE_NAME; using col10=tumor/col11=normal." >&2
+            TUMOR_COL=10
+            NORMAL_COL=11
+        fi
         return 0
     }
 
-    # Read the tumor and normal SM tags from BAM headers (same as mutation_calling_from_bam.sh)
-    # These are needed to match VCF column headers.
+    # Source the authoritative tumor/normal SM tags from the sidecar written by
+    # mutation_calling_from_bam.sh (<sample>_sm_tags.tsv). This avoids guessing the tumor
+    # SM from the directory name, which can differ from the BAM SM tag and collapse columns.
     _TUMOR_SM="$SAMPLE_NAME"
     _NORMAL_SM=""
-    # Try to detect normal SM from the VCF header itself
+    SM_TAGS_FILE=$(find "$SAMPLE_DIR/mutect2_somatic_run" -name "*_sm_tags.tsv" 2>/dev/null | head -n 1)
+    if [[ -f "$SM_TAGS_FILE" ]]; then
+        _SID_TUMOR=$(awk -F'\t' '$1=="TUMOR_SM"{print $2; exit}' "$SM_TAGS_FILE")
+        _SID_NORMAL=$(awk -F'\t' '$1=="NORMAL_SM"{print $2; exit}' "$SM_TAGS_FILE")
+        [[ -n "$_SID_TUMOR" ]] && _TUMOR_SM="$_SID_TUMOR"
+        [[ -n "$_SID_NORMAL" ]] && _NORMAL_SM="$_SID_NORMAL"
+    fi
+    # Fallback: detect normal SM from the VCF header itself (when the sidecar is absent)
     _get_normal_sm_from_vcf() {
         local vcf="$1" tumor_sm="$2"
         $ZCAT "$vcf" | grep '^#CHROM' | head -1 | awk -F'\t' -v tsm="$tumor_sm" '{
@@ -161,7 +208,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         MUTECT_PASS=$($ZCAT "$USE_VCF" | grep -v '^#' | awk -F'\t' '$7 == "PASS" {c++} END {print c+0}')
 
         # Detect sample columns
-        _NORMAL_SM=$(_get_normal_sm_from_vcf "$USE_VCF" "$_TUMOR_SM")
+        [[ -z "$_NORMAL_SM" ]] && _NORMAL_SM=$(_get_normal_sm_from_vcf "$USE_VCF" "$_TUMOR_SM")
         _detect_sample_columns "$USE_VCF" "$_TUMOR_SM" "$_NORMAL_SM"
 
         # Parse with FORMAT-field-name-based extraction (not positional).
@@ -208,11 +255,15 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     elif [[ -f "$FILTERED_VCF" ]]; then
         MUTECT_OK=true
         USE_VCF="$FILTERED_VCF"
+        # NOTE: this fallback parses the raw filtered VCF, which is NOT multiallelic-split
+        # (the annotated VCF is the normalized one). At multiallelic sites the first-element
+        # AF/AD read below may not correspond to the reported ALT. Prefer the annotated VCF.
+        echo "  WARNING: $SAMPLE_NAME has no annotated VCF; parsing non-normalized filtered VCF (AF/AD may be ambiguous at multiallelic sites)." >&2
 
         MUTECT_TOTAL=$($ZCAT "$USE_VCF" | grep -v '^#' | wc -l | awk '{print $1}')
         MUTECT_PASS=$($ZCAT "$USE_VCF" | grep -v '^#' | awk -F'\t' '$7 == "PASS" {c++} END {print c+0}')
 
-        _NORMAL_SM=$(_get_normal_sm_from_vcf "$USE_VCF" "$_TUMOR_SM")
+        [[ -z "$_NORMAL_SM" ]] && _NORMAL_SM=$(_get_normal_sm_from_vcf "$USE_VCF" "$_TUMOR_SM")
         _detect_sample_columns "$USE_VCF" "$_TUMOR_SM" "$_NORMAL_SM"
 
         $ZCAT "$USE_VCF" | grep -v '^#' | awk -F'\t' \
@@ -270,8 +321,8 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     # CNVkit .call.cns columns: chromosome,start,end,gene,log2,depth,probes,weight,cn
     # Also merges p-values from .bintest.cns if available.
     # ================================================================
-    CALL_CNS=$(find "$SAMPLE_DIR/cnvkit_run" -name "*.call.cns" 2>/dev/null | head -n 1)
-    BINTEST_CNS=$(find "$SAMPLE_DIR/cnvkit_run" -name "*.bintest.cns" 2>/dev/null | head -n 1)
+    CALL_CNS=$(find_one "$SAMPLE_DIR/cnvkit_run" -name "*.call.cns")
+    BINTEST_CNS=$(find_one "$SAMPLE_DIR/cnvkit_run" -name "*.bintest.cns")
 
     if [[ -f "$CALL_CNS" ]]; then
         CNVKIT_OK=true
@@ -297,10 +348,12 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             }' "$BINTEST_CNS" > "$PVAL_TMPFILE"
         fi
 
-        # Count aberrations using header-based column lookup
-        CNV_AMP=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        # Count aberrations using header-based column lookup.
+        # If the required columns are absent, the header guard exits early -> count 0
+        # (the detail-extraction awk below emits a single explicit warning).
+        CNV_AMP=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i; if(!("cn" in h)||!("log2" in h)) exit 0; next}
             $h["cn"]>2 && $h["log2"]>0.3{c++} END{print c+0}' "$CALL_CNS")
-        CNV_DEL=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        CNV_DEL=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i; if(!("cn" in h)||!("log2" in h)) exit 0; next}
             $h["cn"]<2 && $h["log2"]<-0.3{c++} END{print c+0}' "$CALL_CNS")
         CNV_ABERRANT=$((CNV_AMP + CNV_DEL))
 
@@ -314,6 +367,12 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             -v pval_file="${PVAL_TMPFILE:-}" '
         NR==1 {
             for(i=1;i<=NF;i++) h[$i]=i
+            # Header guard: required columns must exist, else skip this file with a warning
+            # (prevents $h["..."] resolving to field 0 / whole-line garbage).
+            if(!("chromosome" in h) || !("start" in h) || !("end" in h) || !("log2" in h) || !("cn" in h) || !("depth" in h) || !("probes" in h) || !("weight" in h)) {
+                print "  WARNING: " sample " call.cns missing required columns (chromosome/start/end/log2/cn/depth/probes/weight); skipping CNV detail." > "/dev/stderr"
+                exit 0
+            }
             # Load bin-level p-values into parallel arrays
             n_bins = 0
             if (pval_file != "") {
@@ -375,12 +434,17 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
     # genemetrics columns: chromosome,start,end,gene,log2,depth,weight,probes,
     #                      seg_weight,seg_probes
     # ================================================================
-    GENEMETRICS_FILE=$(find "$SAMPLE_DIR/cnvkit_run" -name "*_genemetrics.tsv" 2>/dev/null | head -n 1)
+    GENEMETRICS_FILE=$(find_one "$SAMPLE_DIR/cnvkit_run" -name "*_genemetrics.tsv")
 
     if [[ -f "$GENEMETRICS_FILE" ]]; then
         awk -F'\t' -v sample="$SAMPLE_NAME" -v batch="$BATCH_NAME" '
         NR==1 {
             for(i=1;i<=NF;i++) h[$i]=i
+            # Header guard: required columns must exist, else skip with a warning.
+            if(!("gene" in h) || !("chromosome" in h) || !("log2" in h) || !("start" in h) || !("end" in h) || !("depth" in h) || !("weight" in h) || !("probes" in h)) {
+                print "  WARNING: " sample " genemetrics missing required columns (gene/chromosome/start/end/log2/depth/weight/probes); skipping." > "/dev/stderr"
+                exit 0
+            }
             next
         }
         {

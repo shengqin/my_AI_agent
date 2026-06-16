@@ -73,20 +73,27 @@ echo ""
 
 # ==============================================================================
 # Pre-flight: Rename existing output directories to avoid stale results
-# Appends current date (e.g., results_somatic_calling_2026-04-29)
+# Appends a unique timestamp (e.g., results_somatic_calling_2026-04-29_141503_12345)
 # ==============================================================================
-DATE_STAMP=$(date +%Y-%m-%d)
-
 rename_if_exists() {
     local DIR="$1"
     if [[ -d "$DIR" ]]; then
-        local BACKUP="${DIR}_${DATE_STAMP}"
-        # If backup already exists today, add time
-        if [[ -d "$BACKUP" ]]; then
-            BACKUP="${DIR}_$(date +%Y-%m-%d_%H%M%S)"
+        # Build a guaranteed-unique backup name (date + time + PID + counter) so two
+        # concurrent orchestrator runs can never compute the same target, and use `mv -n`
+        # (no-clobber) so we never overwrite an existing backup even if names collide.
+        local TS BACKUP n
+        TS="$(date +%Y-%m-%d_%H%M%S)"
+        BACKUP="${DIR}_${TS}_$$"
+        n=0
+        while [[ -e "$BACKUP" ]]; do
+            n=$((n + 1))
+            BACKUP="${DIR}_${TS}_$$_${n}"
+        done
+        echo "  Renaming: $(basename "$DIR") -> $(basename "$BACKUP")"
+        if ! mv -n "$DIR" "$BACKUP"; then
+            echo "ERROR: failed to back up $DIR -> $BACKUP (target may already exist)."
+            exit 1
         fi
-        echo "  Renaming: $(basename $DIR) -> $(basename $BACKUP)"
-        mv "$DIR" "$BACKUP"
     fi
 }
 
@@ -150,6 +157,13 @@ if [[ "${SKIP_PON_BUILD}" == "true" ]]; then
         echo "       Re-run without SKIP_PON_BUILD=true to rebuild."
         exit 1
     fi
+    # The per-site frequency summary is consumed by test.R's CAPP-Seq PoN filter.
+    # Warn loudly if a reused PoN dir predates it, so the filter isn't silently skipped.
+    if [[ ! -f "${MUTECT2_PON_DIR}/pon_site_summary.tsv" ]]; then
+        echo "WARNING: pon_site_summary.tsv not found in ${MUTECT2_PON_DIR}."
+        echo "         The R-level PoN frequency filter (test.R) will be SKIPPED."
+        echo "         Rebuild the PoN (without SKIP_PON_BUILD) to regenerate it."
+    fi
     PON_JOB=""
 else
     echo "[Step 2] Submitting Mutect2 PoN build..."
@@ -181,6 +195,19 @@ CALLING_JOBS=""
 for BATCH_ENTRY in "${BATCHES[@]}"; do
     IFS='|' read -r BATCH_NAME SAMPLE_FILE CFDNA_DIR OUTPUT_DIR ARRAY_SIZE <<< "$BATCH_ENTRY"
 
+    # Compute the array size from the sample file at submit time rather than trusting the
+    # hardcoded value, which drifts as samples are added/removed. The calling script maps
+    # SLURM_ARRAY_TASK_ID directly to the line number (NR) of the sample file, so the array
+    # must span every data line. We count non-empty, non-comment lines.
+    COMPUTED_ARRAY_SIZE=$(awk 'NF && $1 !~ /^#/ {n++} END{print n+0}' "$SAMPLE_FILE")
+    if [[ "${COMPUTED_ARRAY_SIZE}" -lt 1 ]]; then
+        echo "ERROR: No samples found in $SAMPLE_FILE for batch $BATCH_NAME"
+        exit 1
+    fi
+    if [[ "${COMPUTED_ARRAY_SIZE}" != "${ARRAY_SIZE}" ]]; then
+        echo "  NOTE: ${BATCH_NAME} array size ${ARRAY_SIZE} (config) -> ${COMPUTED_ARRAY_SIZE} (from $SAMPLE_FILE)"
+    fi
+
     # Build the dependency string only if PoN jobs were submitted
     DEPENDENCY_ARG=""
     if [[ -n "${CNVKIT_JOB}" && -n "${PON_JOB}" ]]; then
@@ -196,7 +223,7 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
         --mail-type=ALL \
         --mail-user=${SLURM_MAIL} \
         --partition=${SLURM_PARTITION} \
-        --array=1-${ARRAY_SIZE} \
+        --array=1-${COMPUTED_ARRAY_SIZE} \
         ${DEPENDENCY_ARG} \
         --parsable \
         ${SCRIPT_DIR}/mutation_calling_from_bam.sh \
@@ -209,7 +236,7 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
         "${CNVKIT_REF_DIR}/pooled_reference.cnn" \
         "${MUTECT2_PON_DIR}/pon.vcf.gz")
 
-    echo "  ${BATCH_NAME}: job ${BATCH_JOB} (array 1-${ARRAY_SIZE})"
+    echo "  ${BATCH_NAME}: job ${BATCH_JOB} (array 1-${COMPUTED_ARRAY_SIZE})"
 
     # Collect all batch job IDs for the summary dependency
     if [[ -n "$CALLING_JOBS" ]]; then
@@ -231,6 +258,9 @@ for BATCH_ENTRY in "${BATCHES[@]}"; do
     RESULTS_DIRS_ARGS="${RESULTS_DIRS_ARGS} ${OUTPUT_DIR}"
 done
 
+# Pass the Mutect2 PoN per-site summary into the summary job's environment so
+# summarize_variant_calls.sh stages it as <SUMMARY_DIR>/pon_site_summary.tsv,
+# which test.R requires for the CAPP-Seq PoN frequency filter.
 SUMMARY_JOB=$(sbatch \
     --job-name=summarize \
     --time=2:00:00 \
@@ -241,6 +271,7 @@ SUMMARY_JOB=$(sbatch \
     --mail-user=${SLURM_MAIL} \
     --partition=${SLURM_PARTITION} \
     --dependency=afterok:${CALLING_JOBS} \
+    --export=ALL,PON_SITE_SUMMARY="${MUTECT2_PON_DIR}/pon_site_summary.tsv" \
     --parsable \
     ${SCRIPT_DIR}/summarize_variant_calls.sh \
     "${SUMMARY_DIR}" \

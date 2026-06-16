@@ -159,18 +159,40 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
 if (!is.na(COSMIC_VCF) && file.exists(COSMIC_VCF)) {
   cat("  Loading COSMIC annotations for rescue logic...\n")
 
-  # Read COSMIC VCF (just chr, pos, ref, alt, ID columns)
-  cosmic_lines <- readLines(gzfile(COSMIC_VCF))
-  cosmic_lines <- cosmic_lines[!startsWith(cosmic_lines, "#")]
+  # Stream the COSMIC VCF instead of readLines() of the whole file: COSMIC coding VCFs are
+  # large, and readLines loads every line into memory. We decompress, drop the header, and
+  # cut to the first 5 columns in the shell pipe so R only ever sees chr/pos/id/ref/alt.
+  cosmic_df <- tryCatch(
+    read_tsv(
+      pipe(sprintf("gzip -dc %s | grep -v '^#' | cut -f1-5", shQuote(COSMIC_VCF))),
+      col_names = FALSE, show_col_types = FALSE, progress = FALSE
+    ),
+    error = function(e) tibble()
+  )
 
-  if (length(cosmic_lines) > 0) {
-    cosmic_df <- read_tsv(
-      I(cosmic_lines), col_names = FALSE, show_col_types = FALSE,
-      col_select = c(1, 2, 3, 4, 5)
-    ) %>%
+  if (nrow(cosmic_df) > 0) {
+    cosmic_df <- cosmic_df %>%
       rename(Chromosome = X1, Position = X2, COSMIC_ID = X3, Ref = X4, Alt = X5) %>%
       mutate(Position = as.numeric(Position)) %>%
+      # Normalize chromosome naming to match the pipeline's hg19 "chr"-prefixed contigs.
+      # COSMIC GRCh37 VCFs use "1"/"MT" (no "chr"); without this the join silently matches
+      # NOTHING and the COSMIC rescue becomes a no-op.
+      mutate(
+        Chromosome = ifelse(str_detect(Chromosome, "^chr"), Chromosome, paste0("chr", Chromosome)),
+        Chromosome = ifelse(Chromosome == "chrMT", "chrM", Chromosome),
+        Ref = toupper(Ref),
+        Alt = toupper(Alt)
+      ) %>%
       distinct(Chromosome, Position, Ref, Alt, .keep_all = TRUE)
+
+    # Sanity check: how many of our variant positions actually match COSMIC after
+    # normalization? A zero here means the join keys still disagree (investigate naming).
+    n_cosmic_overlap <- snv_filt %>%
+      inner_join(cosmic_df %>% select(Chromosome, Position, Ref, Alt),
+                 by = c("Chromosome", "Position", "Ref", "Alt")) %>%
+      nrow()
+    cat(sprintf("  COSMIC join: %d of %d surviving variants match a COSMIC site (post chr-normalization)\n",
+                n_cosmic_overlap, nrow(snv_filt)))
 
     # --- Step 1: Tag surviving variants with COSMIC status ---
     snv_filt <- snv_filt %>%
@@ -283,18 +305,37 @@ cat(sprintf(
 # ==============================================================================
 cat("Processing CNV data...\n")
 
-# Build a gene coordinate lookup from the Mutect2 data (all variants, not just PASS)
-# Extract min/max position per gene per chromosome to define gene boundaries
-gene_coords <- snv_data %>%
-  filter(Gene != ".") %>%
-  group_by(Gene, Chromosome) %>%
-  summarize(
-    Gene_Start = min(Position),
-    Gene_End = max(Position),
-    .groups = "drop"
-  )
+# Gene coordinate lookup for mapping SV breakpoints to genes.
+# PREFERRED: authoritative gene spans for panel-targeted genes, built from UCSC refGene
+# intersected with the BLYMv2 design BED (see script/mutation_calling/build_panel_gene_coords.py).
+# Using true gene boundaries — instead of the min/max of observed mutation positions — means
+# genes with zero or a single SNV can still receive SV calls, and breakpoints near (not exactly
+# on) a mutation map correctly.
+GENE_COORDS_FILE <- file.path(DATA_DIR, "BLYMv2_gene_coords_hg19.tsv")
 
-cat(sprintf("  Built gene coordinate lookup: %d genes\n", nrow(gene_coords)))
+if (file.exists(GENE_COORDS_FILE)) {
+  gene_coords <- read_tsv(GENE_COORDS_FILE, show_col_types = FALSE) %>%
+    select(Gene, Chromosome, Gene_Start, Gene_End) %>%
+    mutate(Gene_Start = as.numeric(Gene_Start), Gene_End = as.numeric(Gene_End))
+  cat(sprintf("  Loaded panel gene coordinates from %s: %d genes\n",
+              basename(GENE_COORDS_FILE), nrow(gene_coords)))
+} else {
+  # FALLBACK (legacy, less accurate): derive approximate gene boundaries from the
+  # min/max position of observed Mutect2 variants per gene. Genes without SNVs are absent.
+  cat("  WARNING: panel gene-coordinate file not found:\n")
+  cat(sprintf("           %s\n", GENE_COORDS_FILE))
+  cat("           Falling back to mutation-derived gene boundaries (less accurate for SV->gene mapping).\n")
+  cat("           Generate it with: python3 script/mutation_calling/build_panel_gene_coords.py\n")
+  gene_coords <- snv_data %>%
+    filter(Gene != ".") %>%
+    group_by(Gene, Chromosome) %>%
+    summarize(
+      Gene_Start = min(Position),
+      Gene_End = max(Position),
+      .groups = "drop"
+    )
+  cat(sprintf("  Built fallback gene coordinate lookup: %d genes\n", nrow(gene_coords)))
+}
 
 # Note: Gene-level CNV file (cnvkit_gene_cnvs.tsv) is not used here.
 # All CNV events are mapped to their exact cytoband locations from segment data.
@@ -322,9 +363,11 @@ if (file.exists(CNVKIT_FILE)) {
       filter(!Chromosome %in% c("chrX", "chrY"))
 
     # 2. Exclude IGH locus region (chr14:35.8M-69.3M): V(D)J recombination in
-    #    B-cell lineage causes apparent copy loss — germline/lineage artifact
+    #    B-cell lineage causes apparent copy loss — germline/lineage artifact.
+    #    Use interval-OVERLAP logic so that large arm-level segments that merely
+    #    overlap the IGH window are also excluded (not only fully-contained ones).
     cnv_seg_data <- cnv_seg_data %>%
-      filter(!(Chromosome == "chr14" & Start >= 35000000 & End <= 70000000))
+      filter(!(Chromosome == "chr14" & Start < 70000000 & End > 35000000))
 
     # 3. Require minimum probe support: segments driven by 1-4 probes are
     #    highly prone to technical noise in targeted panels
@@ -509,7 +552,9 @@ is_cnv <- rownames(onco_mat) %in% all_cnv_features
 # For mutations: keep top 40 most frequently altered genes
 mut_rows <- onco_mat[!is_cnv, , drop = FALSE]
 mut_counts <- rowSums(mut_rows != "")
-top_mut <- names(sort(mut_counts, decreasing = TRUE)[1:min(40, length(mut_counts))])
+# Use seq_len() to avoid the R `1:0` foot-gun: when there are no mutation rows,
+# `1:min(40, 0)` would yield c(1, 0) and mis-index; seq_len(0) is integer(0).
+top_mut <- names(sort(mut_counts, decreasing = TRUE)[seq_len(min(40, length(mut_counts)))])
 
 # For CNVs: keep ALL cytoband rows (don't cut any — they're already QC-filtered)
 cnv_rows <- onco_mat[is_cnv, , drop = FALSE]
