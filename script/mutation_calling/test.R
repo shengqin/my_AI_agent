@@ -345,14 +345,19 @@ if (nrow(chip_flagged) > 0) {
 }
 
 # First-pass tumor-fraction estimate from confident clonal SNVs.
-# Assumptions/limitations: this uses 2 x median SNV VAF under a heterozygous-diploid
-# model, so it is best treated as a lower-bound-ish estimate. Subclonality biases it
-# down, CNV-altered regions can confound it, and CHIP/aSHM/indel calls are excluded.
-tumor_fraction_counts <- snv_qc %>%
+# Source = snv_filt: the full confident somatic SNV set AFTER depth/alt/VAF QC, normal
+# background subtraction, the panel-of-normals filter, and COSMIC rescue — but BEFORE the
+# protein-altering functional whitelist. Using ALL confident SNVs (synonymous/non-coding
+# passengers included), rather than only driver-level protein-altering calls, gives far more
+# data points per sample and less driver-selection bias, so most samples become estimable.
+# CHIP/aSHM genes and indels are excluded (computed inline since snv_filt predates those flags).
+# Assumptions/limitations: 2 x median SNV VAF under a heterozygous-diploid model, so it is a
+# lower-bound-ish estimate; subclonality biases it down and CNV-altered regions can confound it.
+tumor_fraction_counts <- snv_filt %>%
   filter(
-    Is_CHIP == FALSE,
-    Is_aSHM == FALSE,
-    Is_Indel == FALSE,
+    !(Gene %in% CHIP_GENES),
+    !(Gene %in% ASHM_GENES),
+    nchar(Ref) == 1 & nchar(Alt) == 1, # SNVs only (exclude indels)
     !is.na(Tumor_AF_num)
   ) %>%
   group_by(Sample) %>%
@@ -362,12 +367,13 @@ tumor_fraction_counts <- snv_qc %>%
     .groups = "drop"
   )
 
-tumor_fraction <- tibble(Sample = sort(unique(snv_qc$Sample))) %>%
+# Sample universe = every sample in the input, so all samples appear (NA where < 3 SNVs).
+tumor_fraction <- tibble(Sample = sort(unique(snv_data$Sample))) %>%
   left_join(tumor_fraction_counts, by = "Sample") %>%
   mutate(
     N_SNV_for_TF = replace_na(N_SNV_for_TF, 0L),
     Tumor_Fraction = if_else(N_SNV_for_TF >= 3, pmin(1, 2 * Median_Tumor_AF), NA_real_),
-    TF_Method = "2x_median_SNV_VAF"
+    TF_Method = "2x_median_confident_SNV_VAF"
   ) %>%
   select(Sample, N_SNV_for_TF, Tumor_Fraction, TF_Method)
 
