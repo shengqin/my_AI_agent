@@ -103,7 +103,7 @@ cat("Loading and processing variant data...\n")
 # 2. Read and QC SNV/Indel Data (Mutect2 + SnpEff)
 # ==============================================================================
 # Read data
-snv_data <- read_tsv(MUTECT_FILE, col_types = cols(Tumor_F1R2 = col_character(), Tumor_F2R1 = col_character(), Tumor_AF = col_character(), Normal_AF = col_character(), Tumor_AD_Alt = col_character(), Tumor_AD_Ref = col_character()), show_col_types = FALSE)
+snv_data <- read_tsv(MUTECT_FILE, col_types = cols(Tumor_F1R2 = col_character(), Tumor_F2R1 = col_character(), Tumor_AF = col_character(), Normal_AF = col_character(), Tumor_AD_Alt = col_character(), Tumor_AD_Ref = col_character(), STR = col_character(), RU = col_character(), RPA = col_character()), show_col_types = FALSE)
 
 sample_ids_from_file <- function(file, reader) {
   if (!file.exists(file)) return(character(0))
@@ -176,6 +176,49 @@ if (has_strand_cols) {
   cat("  Indel strand bias filter: applied (F1R2/F2R1 columns present)\n")
 } else {
   cat("  Indel strand bias filter: SKIPPED (F1R2/F2R1 columns not found — re-run pipeline with orientation model)\n")
+}
+
+# QC Filter 2.6: Homopolymer / short-tandem-repeat (STR) indel filter
+# Mutect2's per-sample STR model (STRQ) can still PASS slippage indels that sit in long
+# mono-/di-nucleotide repeats — e.g. CIITA p.Gly656fs at a C7 run (RU=C;RPA=7,8), ARID5B
+# p.Lys1027fs in an A-run, PPM1D p.Asn512fs. These recur at IDENTICAL coordinates across the
+# cohort at low VAF (often with reciprocal +1/-1 alleles) and are polymerase-slippage
+# artifacts, not somatic drivers. Drop indels flagged STR whose repeat unit is short (<=2 nt)
+# and whose tract is long (max RPA across alleles >= threshold).
+# SNVs are deliberately NOT touched here: aSHM and real drivers occur in repeat/motif-rich
+# GC B-cell genes, so SNVs are gated by PoN/normal/strand evidence instead (filters below).
+# Backward compatible: only applies when STR/RU/RPA columns are present (re-run the summarizer).
+STR_MAX_RU_LEN <- 2L # repeat unit length: 1 = homopolymer, 2 = dinucleotide
+STR_MIN_RPA <- 5L    # minimum repeat copies (ref or alt) to call a tract slippage-prone
+has_str_cols <- all(c("STR", "RU", "RPA") %in% colnames(snv_filt))
+
+if (has_str_cols) {
+  parse_max_rpa <- function(x) {
+    # RPA is comma-separated repeats-per-allele (ref,alt[,alt2...]); take the max, NA-safe.
+    vapply(strsplit(as.character(x), ","), function(v) {
+      v <- suppressWarnings(as.numeric(v))
+      if (all(is.na(v))) NA_real_ else max(v, na.rm = TRUE)
+    }, numeric(1))
+  }
+  n_before_str <- nrow(snv_filt)
+  snv_filt <- snv_filt %>%
+    mutate(
+      .is_indel = (nchar(Ref) != nchar(Alt)) | nchar(Ref) > 1 | nchar(Alt) > 1,
+      .str_flag = as.character(STR) %in% c("1", "TRUE", "true"),
+      .ru_len = ifelse(is.na(RU) | RU == ".", NA_integer_, nchar(as.character(RU))),
+      .max_rpa = parse_max_rpa(RPA),
+      .is_slippage_indel = .is_indel & .str_flag &
+        !is.na(.ru_len) & .ru_len <= STR_MAX_RU_LEN &
+        !is.na(.max_rpa) & .max_rpa >= STR_MIN_RPA
+    ) %>%
+    filter(!.is_slippage_indel) %>%
+    select(-.is_indel, -.str_flag, -.ru_len, -.max_rpa, -.is_slippage_indel)
+  cat(sprintf(
+    "  Homopolymer/STR indel filter: applied (removed %d slippage indels; RU<=%dnt & max RPA>=%d)\n",
+    n_before_str - nrow(snv_filt), STR_MAX_RU_LEN, STR_MIN_RPA
+  ))
+} else {
+  cat("  Homopolymer/STR indel filter: SKIPPED (STR/RU/RPA columns not found — re-run summarize_variant_calls.sh)\n")
 }
 
 # QC Filter 2b: PoN Frequency Filter (per published CAPP-Seq heuristics)
@@ -589,6 +632,12 @@ if (file.exists(GENE_COORDS_FILE)) {
 
 # Read segment-level CNV data and intersect with panel gene coordinates
 cnv_seg_mapped <- tibble(Sample = character(), Gene = character(), Mutation_Class = character())
+# Detailed CNV map that preserves the PRE-MERGE cytoband annotation (e.g. "6p21.1"),
+# alongside the merged OncoPrint row label (e.g. "6p"). Used for the element export.
+cnv_seg_mapped_detailed <- tibble(
+  Sample = character(), Cytoband = character(), OncoPrint_Row = character(),
+  Mutation_Class = character()
+)
 n_sensitive_cnv <- 0L
 
 # Load cytoband data to name large regional CNVs
@@ -735,6 +784,7 @@ if (file.exists(CNVKIT_FILE)) {
 
           clean_chr <- str_remove(seg_j$Chromosome, "^chr")
           feature_name <- paste0(clean_chr, " CNV") # Fallback
+          cytoband_full <- paste0(clean_chr, " (unbanded)") # Pre-merge annotation fallback
 
           # Default: collapse to the chromosome ARM (e.g. "6p"/"6q") so the OncoPrint isn't
           # fragmented into many adjacent sub-band rows (6p21.1, 6p22.1, 6p22.2, ...).
@@ -745,6 +795,7 @@ if (file.exists(CNVKIT_FILE)) {
             if (nrow(band_hit) > 0) {
               arm <- substr(band_hit$name[1], 1, 1) # "p" or "q"
               feature_name <- paste0(clean_chr, arm) # e.g. "6p"
+              cytoband_full <- paste0(clean_chr, band_hit$name[1]) # e.g. "6p21.1" (pre-merge)
             }
           }
 
@@ -756,6 +807,7 @@ if (file.exists(CNVKIT_FILE)) {
           cnv_hits[[length(cnv_hits) + 1]] <- tibble(
             Sample = seg_j$Sample,
             Gene = feature_name, # Storing location replacing the 'Gene' row name
+            Cytoband = cytoband_full, # Pre-merge cytoband annotation
             Log2_Ratio = seg_j$Log2_Ratio,
             Copy_Number = seg_j$Copy_Number,
             Call_Type = seg_j$Call_Type,
@@ -763,8 +815,13 @@ if (file.exists(CNVKIT_FILE)) {
           )
         }
 
-        cnv_seg_mapped <- bind_rows(cnv_hits) %>%
+        cnv_hits_all <- bind_rows(cnv_hits)
+        cnv_seg_mapped <- cnv_hits_all %>%
           select(Sample, Gene, Mutation_Class) %>%
+          distinct()
+        # Detailed map keyed on the pre-merge cytoband (for the element export).
+        cnv_seg_mapped_detailed <- cnv_hits_all %>%
+          select(Sample, Cytoband, OncoPrint_Row = Gene, Mutation_Class) %>%
           distinct()
       }
 
@@ -960,6 +1017,43 @@ row_splits <- c(
 row_splits <- factor(row_splits, levels = c("Mutations (SNV/Indel/SV)", "Copy Number Alterations"))
 
 cat(sprintf("  Final OncoPrint: %d rows x %d samples\n", nrow(onco_mat_plot), ncol(onco_mat_plot)))
+
+# ==============================================================================
+# Export OncoPrint elements (long format) to combined_summary/.
+# One row per Sample x feature x alteration, restricted to what the OncoPrint shows.
+# For CNVs the PRE-MERGE cytoband annotation (e.g. "6p21.1") is used as the feature,
+# with the merged OncoPrint row label (e.g. "6p") kept for traceability.
+# ==============================================================================
+ONCOPRINT_ELEMENTS_TSV <- file.path(RESULTS_DIR, "oncoprint_elements.tsv")
+plotted_samples <- colnames(onco_mat_plot)
+plotted_cnv_rows <- rownames(cnv_rows_nonempty)
+
+# Mutations + SVs: restrict to the genes actually shown (top_mut); strip "-T1".
+mut_sv_elements <- bind_rows(
+  snv_qc %>% transmute(Sample, Category = "SNV/Indel", Gene, Alteration = Mutation_Class),
+  sv_qc %>% transmute(Sample, Category = "SV", Gene, Alteration = Mutation_Class)
+) %>%
+  mutate(Sample = str_remove(Sample, "-T1$")) %>%
+  filter(Gene %in% top_mut, Sample %in% plotted_samples) %>%
+  transmute(Sample, Category, Feature = Gene, Cytoband = NA_character_,
+            OncoPrint_Row = Gene, Alteration)
+
+# CNVs: pre-merge cytoband as the feature; restrict to plotted rows/samples.
+cnv_elements <- cnv_seg_mapped_detailed %>%
+  mutate(Sample = str_remove(Sample, "-T1$")) %>%
+  filter(OncoPrint_Row %in% plotted_cnv_rows, Sample %in% plotted_samples) %>%
+  transmute(Sample, Category = "CNV", Feature = Cytoband, Cytoband,
+            OncoPrint_Row, Alteration = Mutation_Class)
+
+oncoprint_elements <- bind_rows(mut_sv_elements, cnv_elements) %>%
+  distinct() %>%
+  arrange(Category, OncoPrint_Row, Sample, Alteration)
+
+write_tsv(oncoprint_elements, ONCOPRINT_ELEMENTS_TSV)
+cat(sprintf(
+  "  Wrote %d OncoPrint elements (%d CNV with pre-merge cytobands) to %s\n",
+  nrow(oncoprint_elements), nrow(cnv_elements), ONCOPRINT_ELEMENTS_TSV
+))
 
 # Print alteration type breakdown
 all_types <- unlist(str_split(onco_mat_plot[onco_mat_plot != ""], ";"))

@@ -102,7 +102,7 @@ echo ""
 # ---- Write headers ----
 echo "Sample,Batch,Pipeline_Status,Mutect2_Total,Mutect2_PASS,Manta_PASS_SVs,Manta_Total_SVs,CNVkit_Aberrant_Segments,CNVkit_Amplifications,CNVkit_Deletions" > "$SUMMARY_CSV"
 
-echo -e "Sample\tBatch\tChromosome\tPosition\tRef\tAlt\tFilter\tGene\tVariant_Type\tProtein_Change\tTumor_AF\tTumor_AD_Ref\tTumor_AD_Alt\tTumor_DP\tNormal_AF\tNormal_DP\tTumor_F1R2\tTumor_F2R1" > "$MUTECT_DETAILS"
+echo -e "Sample\tBatch\tChromosome\tPosition\tRef\tAlt\tFilter\tGene\tVariant_Type\tProtein_Change\tTumor_AF\tTumor_AD_Ref\tTumor_AD_Alt\tTumor_DP\tNormal_AF\tNormal_DP\tTumor_F1R2\tTumor_F2R1\tSTR\tRU\tRPA" > "$MUTECT_DETAILS"
 
 echo -e "Sample\tBatch\tChromosome\tStart\tEnd\tLog2_Ratio\tCopy_Number\tDepth\tWeight\tProbes\tMin_P_Value\tN_Significant_Bins\tCall_Type" > "$CNV_DETAILS"
 
@@ -236,6 +236,15 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
                     break;
                 }
             }
+            # Mutect2 short-tandem-repeat annotations (for homopolymer/slippage filtering).
+            # STR is a flag (present/absent); RU is the repeat unit; RPA is repeats-per-allele.
+            # Dedicated scan (the ANN loop above breaks early, so re-scan all INFO fields).
+            str_flag = "0"; ru = "."; rpa = ".";
+            for (i = 1; i <= n; i++) {
+                if (info_fields[i] == "STR") str_flag = "1";
+                else if (substr(info_fields[i], 1, 3) == "RU=")  ru  = substr(info_fields[i], 4);
+                else if (substr(info_fields[i], 1, 4) == "RPA=") rpa = substr(info_fields[i], 5);
+            }
             # Parse FORMAT field names to find AF, AD, DP, F1R2, F2R1 indices
             nf_count = split($9, fmt, ":");
             af_idx=0; ad_idx=0; dp_idx=0; f1_idx=0; f2_idx=0;
@@ -257,7 +266,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             t_ad  = (ad_idx>0) ? tf[ad_idx] : ".,."; split(t_ad, tad, ",");
             t_f1  = (f1_idx>0) ? tf[f1_idx] : ".,.";
             t_f2  = (f2_idx>0) ? tf[f2_idx] : ".,.";
-            print sample"\t"batch"\t"$1"\t"$2"\t"$4"\t"$5"\t"$7"\t"gene"\t"effect"\t"protein"\t"t_af"\t"tad[1]"\t"tad[2]"\t"t_dp"\t"n_af"\t"n_dp"\t"t_f1"\t"t_f2
+            print sample"\t"batch"\t"$1"\t"$2"\t"$4"\t"$5"\t"$7"\t"gene"\t"effect"\t"protein"\t"t_af"\t"tad[1]"\t"tad[2]"\t"t_dp"\t"n_af"\t"n_dp"\t"t_f1"\t"t_f2"\t"str_flag"\t"ru"\t"rpa
         }' >> "$MUTECT_DETAILS"
 
     elif [[ -f "$FILTERED_VCF" ]]; then
@@ -277,6 +286,14 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
         $ZCAT "$USE_VCF" | grep -v '^#' | awk -F'\t' \
             -v sample="$SAMPLE_NAME" -v batch="$BATCH_NAME" \
             -v tcol="$TUMOR_COL" -v ncol="$NORMAL_COL" '{
+            # Mutect2 short-tandem-repeat annotations (INFO not pre-split in this fallback).
+            n8 = split($8, info8, ";");
+            str_flag = "0"; ru = "."; rpa = ".";
+            for (i = 1; i <= n8; i++) {
+                if (info8[i] == "STR") str_flag = "1";
+                else if (substr(info8[i], 1, 3) == "RU=")  ru  = substr(info8[i], 4);
+                else if (substr(info8[i], 1, 4) == "RPA=") rpa = substr(info8[i], 5);
+            }
             nf_count = split($9, fmt, ":");
             af_idx=0; ad_idx=0; dp_idx=0; f1_idx=0; f2_idx=0;
             for (i=1; i<=nf_count; i++) {
@@ -295,7 +312,7 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             t_ad  = (ad_idx>0) ? tf[ad_idx] : ".,."; split(t_ad, tad, ",");
             t_f1  = (f1_idx>0) ? tf[f1_idx] : ".,.";
             t_f2  = (f2_idx>0) ? tf[f2_idx] : ".,.";
-            print sample"\t"batch"\t"$1"\t"$2"\t"$4"\t"$5"\t"$7"\t.\t.\t.\t"t_af"\t"tad[1]"\t"tad[2]"\t"t_dp"\t"n_af"\t"n_dp"\t"t_f1"\t"t_f2
+            print sample"\t"batch"\t"$1"\t"$2"\t"$4"\t"$5"\t"$7"\t.\t.\t.\t"t_af"\t"tad[1]"\t"tad[2]"\t"t_dp"\t"n_af"\t"n_dp"\t"t_f1"\t"t_f2"\t"str_flag"\t"ru"\t"rpa
         }' >> "$MUTECT_DETAILS"
     fi
 
