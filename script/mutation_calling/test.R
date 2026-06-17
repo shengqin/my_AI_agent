@@ -724,6 +724,28 @@ onco_mat_plot <- rbind(
   cnv_rows_nonempty
 )
 
+# Add cohort samples with no post-QC alterations as empty OncoPrint columns.
+cohort_samples <- sort(unique(str_remove(snv_data$Sample, "-T1$")))
+missing_cohort_samples <- setdiff(cohort_samples, colnames(onco_mat_plot))
+if (length(missing_cohort_samples) > 0) {
+  plot_rownames <- rownames(onco_mat_plot)
+  if (is.null(plot_rownames)) {
+    plot_rownames <- character(0)
+  }
+  empty_cols <- matrix(
+    "",
+    nrow = nrow(onco_mat_plot),
+    ncol = length(missing_cohort_samples),
+    dimnames = list(plot_rownames, missing_cohort_samples)
+  )
+  onco_mat_plot <- cbind(onco_mat_plot, empty_cols)
+}
+cat(sprintf(
+  "  Added %d alteration-free cohort samples to OncoPrint: %s\n",
+  length(missing_cohort_samples),
+  ifelse(length(missing_cohort_samples) > 0, paste(missing_cohort_samples, collapse = ", "), "none")
+))
+
 # Build row_split vector matching the combined matrix
 row_splits <- c(
   rep("Mutations (SNV/Indel/SV)", length(top_mut)),
