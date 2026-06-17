@@ -31,10 +31,20 @@ PON_SUMMARY_FILE <- file.path(RESULTS_DIR, "pon_site_summary.tsv")
 # Example: CosmicCodingMuts.vcf.gz (hg19/GRCh37)
 COSMIC_VCF <- file.path(DATA_DIR, "Cosmic_CompleteTargetedScreensMutant_v103_GRCh37.vcf.gz")
 
-# Aberrant somatic hypermutation (aSHM)-associated genes to FLAG as likely passengers and
-# show distinctly in the OncoPrint, rather than dropping them outright. Canonical drivers
-# (BCL2, BCL6, SOCS1, ...) are intentionally NOT in this list. Currently just IGLL5.
-ASHM_GENES <- c("IGLL5")
+# Aberrant somatic hypermutation (aSHM) hotspots in germinal-center B-cell lymphoma.
+# Mutations here are predominantly aSHM by-products (passengers). They are (a) FLAGGED and shown
+# distinctly as "aSHM-associated (likely passenger)", and (b) ALLOWED TO BYPASS the panel-of-normals
+# recurrence filter — recurrence at these loci reflects aSHM biology, not a technical artifact.
+# Per-sample normal subtraction (QC Filter 2) STILL applies, so germline/CHIP leakage is guarded.
+# Curated/editable. Bona fide point-mutation drivers (SGK1, DUSP2, SOCS1, STAT6, GNA13, CREBBP,
+# EP300, EZH2, TNFAIP3, B2M, CARD11, MYD88, TP53, KMT2D, ...) are intentionally EXCLUDED.
+# NOTE: MYC/BCL2/BCL6 are listed because their recurrent *coding point mutations* in GC lymphoma
+# are largely aSHM; their driver role is via translocation (captured as SVs), not point mutations.
+ASHM_GENES <- c(
+  "IGLL5", "BCL2", "BCL6", "MYC", "PAX5", "PIM1", "RHOH", "IRF4", "BCL7A",
+  "KLHL6", "SERPINA9", "ST6GAL1", "DTX1", "ZFP36L1", "CD83", "BTG1", "BTG2",
+  "H1-2", "H1-3", "H1-4", "H1-5", "H3C2"
+)
 
 # Clonal hematopoiesis (CHIP) genes. Because the matched normal is PBL (blood) and the
 # tumor input is plasma cfDNA, mutations in these genes may originate from clonal
@@ -145,6 +155,9 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
   # Keep if: not in PoN, or in < 10% of PoN, or in < 30% with tumor >> PoN
   snv_filt <- snv_filt %>%
     filter(
+      # aSHM hotspots bypass PoN recurrence: recurrence here is aSHM biology, not artifact
+      # (per-sample normal subtraction from QC Filter 2 still applied above).
+      Gene %in% ASHM_GENES |
       # Not in PoN at all — automatically passes
       Fraction_PON_Samples == 0 |
       # In < 10% of PoN samples
@@ -159,6 +172,9 @@ if (!is.na(PON_SUMMARY_FILE) && file.exists(PON_SUMMARY_FILE)) {
   #   AND read support in < 30% of PoN samples (per paper's additional constraint)
   snv_filt <- snv_filt %>%
     filter(
+      # aSHM hotspots are exempt from the stricter in-PoN normal-VAF gate (biology, not artifact);
+      # they already passed the 0.25% normal subtraction in QC Filter 2.
+      Gene %in% ASHM_GENES |
       !In_PON |
       (Normal_AF_num < 0.001) |
       (Tumor_AF_num > 20 * pmax(Normal_AF_num, Max_PON_AF) &
