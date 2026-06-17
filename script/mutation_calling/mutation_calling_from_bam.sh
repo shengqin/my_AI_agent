@@ -88,6 +88,12 @@ MUTECT2_PON="${8:-}"
 # Path to the reference genome FASTA used to align the BAMs
 REF_GENOME="/oak/stanford/groups/emoding/sequencing/pipeline/indices/hg19.fa"
 
+# Conda environments. These are PREFIX (path) environments on group storage and must be
+# activated by full path (conda activate <name> only resolves named envs). Override via
+# CNVKIT_ENV / SNPEFF_ENV if your environments live elsewhere.
+CNVKIT_ENV="${CNVKIT_ENV:-/oak/stanford/groups/emoding/analysis/brian/Cytospace/.conda_envs/cnvkit}"
+SNPEFF_ENV="${SNPEFF_ENV:-/oak/stanford/groups/emoding/analysis/brian/Cytospace/.conda_envs/snpeff}"
+
 # ==============================================================================
 # Sample Selection via SLURM Array
 # ==============================================================================
@@ -331,7 +337,7 @@ else
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting SnpEff Annotation for $SAMPLE_NAME..."
 
     source ~/miniconda3/etc/profile.d/conda.sh
-    conda activate snpeff
+    conda activate "$SNPEFF_ENV"
 
     # Verify snpEff is actually present in the activated env before relying on it.
     if ! command -v snpEff &>/dev/null; then
@@ -391,7 +397,7 @@ else
 
     # Load conda and activate the cnvkit environment
     source ~/miniconda3/etc/profile.d/conda.sh
-    conda activate cnvkit
+    conda activate "$CNVKIT_ENV"
 
     # Check if CNVkit is available
     if command -v cnvkit.py &> /dev/null; then
@@ -456,7 +462,7 @@ elif [[ -n "$CNVKIT_CNR" && -f "$CNVKIT_CNR" ]]; then
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Starting CNVkit genemetrics for $SAMPLE_NAME..."
 
     source ~/miniconda3/etc/profile.d/conda.sh
-    conda activate cnvkit
+    conda activate "$CNVKIT_ENV"
 
     if command -v cnvkit.py &> /dev/null; then
         # genemetrics maps segment-level CN ratios to individual genes.

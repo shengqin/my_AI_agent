@@ -18,6 +18,10 @@
 
 set -euo pipefail
 
+# CNVkit conda environment (PREFIX/path env on group storage — activate by full path).
+# Override CNVKIT_ENV if your environment lives elsewhere.
+CNVKIT_ENV="${CNVKIT_ENV:-/oak/stanford/groups/emoding/analysis/brian/Cytospace/.conda_envs/cnvkit}"
+
 usage() {
     echo "Usage: $(basename "$0") <tumor_fraction.csv> <results_dir1> [results_dir2 ...]" >&2
 }
@@ -107,10 +111,10 @@ run_cnvkit_with_purity() {
     bash -lc '
         set -euo pipefail
         source ~/miniconda3/etc/profile.d/conda.sh
-        conda activate cnvkit
+        conda activate "$6"
         cnvkit.py call "$1" --purity "$2" -o "$3"
         cnvkit.py bintest "$4" -s "$3" > "$5"
-    ' _ "$base_cns" "$purity" "$out_call" "$cnr" "$out_bintest"
+    ' _ "$base_cns" "$purity" "$out_call" "$cnr" "$out_bintest" "$CNVKIT_ENV"
 }
 
 processed=0

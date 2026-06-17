@@ -121,8 +121,12 @@ echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Building pooled reference from ${#NORMAL_
 # ==============================================================================
 # Build Pooled Reference with CNVkit
 # ==============================================================================
+# CNVkit conda environment. These are PREFIX (path) environments on group storage, so they
+# must be activated by full path (conda activate <name> only resolves named envs). Override
+# CNVKIT_ENV if your environment lives elsewhere.
+CNVKIT_ENV="${CNVKIT_ENV:-/oak/stanford/groups/emoding/analysis/brian/Cytospace/.conda_envs/cnvkit}"
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate cnvkit
+conda activate "$CNVKIT_ENV"
 
 if ! command -v cnvkit.py &> /dev/null; then
     echo "ERROR: cnvkit.py not found in conda env. Aborting."
