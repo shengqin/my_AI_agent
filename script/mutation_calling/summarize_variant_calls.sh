@@ -400,16 +400,19 @@ for RESULTS_DIR in "${RESULTS_DIRS[@]}"; do
             chr     = $h["chromosome"]
             s       = $h["start"] + 0
             e       = $h["end"] + 0
-            log2val = $h["log2"]
+            log2val = $h["log2"] + 0
             depth   = $h["depth"]
             probes  = $h["probes"]
             weight  = $h["weight"]
-            cn      = $h["cn"]
+            cn      = $h["cn"] + 0
 
-            call_type = "Neutral"
+            # Keep strict Amplification/Deletion labels unchanged, but also emit
+            # non-flat sub-threshold candidate segments so downstream tumor-fraction
+            # aware logic can evaluate them. Flat diploid noise is still dropped.
+            call_type = "SubThreshold"
             if (cn > 2 && log2val > 0.3) call_type = "Amplification"
             else if (cn < 2 && log2val < -0.3) call_type = "Deletion"
-            else next
+            else if ((log2val < 0 ? -log2val : log2val) < 0.1 && cn == 2) next
 
             # Range-scan bins on the same chromosome that fall fully inside this segment
             min_pv_str = ""
