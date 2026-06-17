@@ -386,7 +386,19 @@ snv_rescue <- snv_rescue %>%
     Is_Indel = (nchar(Ref) != nchar(Alt)) | nchar(Ref) > 1 | nchar(Alt) > 1,
     Is_aSHM = FALSE,
     Is_CHIP = FALSE,
-    Mutation_Class = "Rescued_Driver_LowVAF"
+    # Per user request, rescued driver variants are shown as ORDINARY mutations (their real
+    # SNV/indel class) — NO separate "rescued" tag/category. The rescue criteria above are
+    # unchanged; only the display label differs.
+    Mutation_Class = case_when(
+      str_detect(Variant_Type, "frameshift") ~ "Frameshift_Indel",
+      str_detect(Variant_Type, "inframe") ~ "Inframe_Indel",
+      Variant_Type == "missense_variant" ~ "Missense_SNV",
+      Variant_Type == "missense_variant&splice_region_variant" ~ "Missense_SNV",
+      Variant_Type == "stop_gained" ~ "Nonsense_SNV",
+      str_detect(Variant_Type, "splice_acceptor|splice_donor") ~ "Splice_Site",
+      Variant_Type == "5_prime_UTR_premature_start_codon_gain_variant" ~ "UTR_SNV",
+      TRUE ~ "Other_SNV"
+    )
   )
 
 cat(sprintf("  Driver-gene near-threshold rescue: %d variants rescued\n", nrow(snv_rescue)))
