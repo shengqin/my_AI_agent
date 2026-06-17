@@ -42,6 +42,14 @@ ASHM_GENES <- c("IGLL5")
 CHIP_GENES <- c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53", "JAK2",
                 "SF3B1", "SRSF2", "GNB1", "CBL", "GNAS")
 
+# Canonical NLPHL/GCB-lymphoma drivers eligible for a narrow near-threshold rescue.
+# Intentionally excludes aSHM-passenger genes and CHIP genes at filtering time below.
+DRIVER_GENES <- c("SGK1", "DUSP2", "JUNB", "SOCS1", "NFKBIE", "STAT6", "GNA13",
+                  "CREBBP", "EP300", "EZH2", "TNFAIP3", "B2M", "CIITA", "BCL6",
+                  "ITPKB", "MEF2B", "KMT2D", "CARD11", "XPO1", "ARID1A", "ATM",
+                  "TP53", "NOTCH1", "NOTCH2", "SPEN", "HIST1H1E", "GNA13",
+                  "MYD88", "CD79B", "PIM1")
+
 # Ensure the output directory exists (for OncoPrint PDF, QC plots, and review CSVs below).
 dir.create(file.path(PROJECT_DIR, "analysis"), showWarnings = FALSE, recursive = TRUE)
 
@@ -314,6 +322,64 @@ snv_qc <- snv_filt %>%
     Is_CHIP = Gene %in% CHIP_GENES,
     Mutation_Class = ifelse(Is_aSHM, "aSHM_Variant", Mutation_Class)
   )
+
+# Driver-gene near-threshold rescue: strictly limited to PASS, protein-altering,
+# non-CHIP/non-aSHM drivers in the 0.25%-<0.5% VAF band. This recovers plausible
+# low-VAF somatic drivers without bypassing Mutect2 filters, normal subtraction, or PoN checks.
+snv_rescue <- snv_data %>%
+  filter(Filter == "PASS") %>%
+  filter(
+    Gene %in% DRIVER_GENES,
+    !(Gene %in% CHIP_GENES),
+    !(Gene %in% ASHM_GENES),
+    !Gene %in% c("ACTB", "ABO", "MPEG1"),
+    !str_detect(Gene, "^ELK2AP")
+  ) %>%
+  mutate(
+    Tumor_AF_num = as.numeric(sapply(strsplit(as.character(Tumor_AF), ","), `[`, 1)),
+    Normal_AF_num = as.numeric(sapply(strsplit(as.character(Normal_AF), ","), `[`, 1)),
+    Tumor_AD_Alt_num = as.numeric(sapply(strsplit(as.character(Tumor_AD_Alt), ","), `[`, 1))
+  ) %>%
+  mutate(Normal_AF_num = replace_na(Normal_AF_num, 0)) %>%
+  filter(
+    Variant_Type %in% altering_effects,
+    Tumor_DP >= 100,
+    Normal_DP >= 20,
+    Tumor_AD_Alt_num >= 4,
+    Tumor_AF_num >= 0.0025,
+    Tumor_AF_num < 0.005,
+    (Normal_AF_num < 0.0025) |
+      (Normal_AF_num < 0.01 & Tumor_AF_num > (20 * Normal_AF_num))
+  )
+
+if (exists("pon_data")) {
+  snv_rescue <- snv_rescue %>%
+    left_join(
+      pon_data,
+      by = c("Chromosome" = "Chromosome", "Position" = "Position",
+             "Ref" = "Ref", "Alt" = "Alt")
+    ) %>%
+    mutate(Fraction_PON_Samples = replace_na(Fraction_PON_Samples, 0)) %>%
+    filter(Fraction_PON_Samples < 0.10)
+}
+
+snv_rescue <- snv_rescue %>%
+  anti_join(snv_qc, by = c("Sample", "Chromosome", "Position", "Ref", "Alt")) %>%
+  mutate(
+    Is_Indel = (nchar(Ref) != nchar(Alt)) | nchar(Ref) > 1 | nchar(Alt) > 1,
+    Is_aSHM = FALSE,
+    Is_CHIP = FALSE,
+    Mutation_Class = "Rescued_Driver_LowVAF"
+  )
+
+cat(sprintf("  Driver-gene near-threshold rescue: %d variants rescued\n", nrow(snv_rescue)))
+if (nrow(snv_rescue) > 0) {
+  snv_rescue %>%
+    select(Sample, Gene, Tumor_AF = Tumor_AF_num) %>%
+    arrange(Sample, Gene) %>%
+    print(n = Inf)
+  snv_qc <- bind_rows(snv_qc, snv_rescue)
+}
 
 cat(sprintf(
   "  Mutect2 after QC: %d protein-altering variants across %d genes\n",
@@ -774,6 +840,7 @@ col <- c(
   "UTR_SNV"          = "#F39C12", # Gold/Amber
   "Other_SNV"        = "#7F8C8D", # Gray
   "aSHM_Variant"     = "#85C1AE", # Teal — aSHM-associated, likely passenger (e.g. IGLL5)
+  "Rescued_Driver_LowVAF" = "#4DBD74", # Light green with hatch marks in alter_fun
   # Indel types
   "Frameshift_Indel" = "#2C3E50", # Dark Navy Blue (differentiated from Nonsense)
   "Inframe_Indel"    = "#993404", # Brown (cBioPortal standard)
@@ -813,6 +880,14 @@ alter_fun <- list(
   # aSHM-associated (likely passenger): half-height to visually denote lower confidence
   "aSHM_Variant" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h * 0.5, gp = gpar(fill = col["aSHM_Variant"], col = NA))
+  },
+  # Near-threshold driver rescue: shorter light-green rectangle with cross-hatch overlay.
+  "Rescued_Driver_LowVAF" = function(x, y, w, h) {
+    grid.rect(x, y, w - unit(0.5, "pt"), h * 0.55, gp = gpar(fill = col["Rescued_Driver_LowVAF"], col = NA))
+    grid.segments(x - w * 0.35, y - h * 0.20, x + w * 0.35, y + h * 0.20,
+                  gp = gpar(col = "#1B5E20", lwd = 0.8))
+    grid.segments(x - w * 0.35, y + h * 0.20, x + w * 0.35, y - h * 0.20,
+                  gp = gpar(col = "#1B5E20", lwd = 0.8))
   },
   # --- Indel types: slightly shorter (cBioPortal uses ~2/3 height for inframe) ---
   "Frameshift_Indel" = function(x, y, w, h) {
@@ -860,6 +935,7 @@ alter_fun_used <- alter_fun[c("background", names(col_used))]
 # Create human-readable legend labels
 legend_labels <- names(col_used) %>%
   str_replace("^aSHM_Variant$", "aSHM-associated (likely passenger)") %>%
+  str_replace("^Rescued_Driver_LowVAF$", "Driver rescue (0.25-0.5% VAF, low-confidence)") %>%
   str_replace("^Amplification_LowTF$", "Amplification (low tumor-fraction)") %>%
   str_replace("^Deletion_LowTF$", "Deletion (low tumor-fraction)") %>%
   str_replace("_SNV", " (SNV)") %>%
