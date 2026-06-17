@@ -344,6 +344,40 @@ if (nrow(chip_flagged) > 0) {
   cat("  CHIP-gene calls flagged for manual review: 0\n")
 }
 
+# First-pass tumor-fraction estimate from confident clonal SNVs.
+# Assumptions/limitations: this uses 2 x median SNV VAF under a heterozygous-diploid
+# model, so it is best treated as a lower-bound-ish estimate. Subclonality biases it
+# down, CNV-altered regions can confound it, and CHIP/aSHM/indel calls are excluded.
+tumor_fraction_counts <- snv_qc %>%
+  filter(
+    Is_CHIP == FALSE,
+    Is_aSHM == FALSE,
+    Is_Indel == FALSE,
+    !is.na(Tumor_AF_num)
+  ) %>%
+  group_by(Sample) %>%
+  summarize(
+    N_SNV_for_TF = n(),
+    Median_Tumor_AF = median(Tumor_AF_num),
+    .groups = "drop"
+  )
+
+tumor_fraction <- tibble(Sample = sort(unique(snv_qc$Sample))) %>%
+  left_join(tumor_fraction_counts, by = "Sample") %>%
+  mutate(
+    N_SNV_for_TF = replace_na(N_SNV_for_TF, 0L),
+    Tumor_Fraction = if_else(N_SNV_for_TF >= 3, pmin(1, 2 * Median_Tumor_AF), NA_real_),
+    TF_Method = "2x_median_SNV_VAF"
+  ) %>%
+  select(Sample, N_SNV_for_TF, Tumor_Fraction, TF_Method)
+
+TUMOR_FRACTION_CSV <- file.path(PROJECT_DIR, "analysis", "tumor_fraction.csv")
+write_csv(tumor_fraction, TUMOR_FRACTION_CSV)
+cat(sprintf(
+  "  Tumor-fraction estimates: %d samples (%d with >=3 confident SNVs) -> %s\n",
+  nrow(tumor_fraction), sum(!is.na(tumor_fraction$Tumor_Fraction)), TUMOR_FRACTION_CSV
+))
+
 # ==============================================================================
 # 3. Read Segment-Level CNV Data and Map to Panel Genes
 # ==============================================================================
@@ -386,6 +420,7 @@ if (file.exists(GENE_COORDS_FILE)) {
 
 # Read segment-level CNV data and intersect with panel gene coordinates
 cnv_seg_mapped <- tibble(Sample = character(), Gene = character(), Mutation_Class = character())
+n_sensitive_cnv <- 0L
 
 # Load cytoband data to name large regional CNVs
 cytoband_file <- file.path(DATA_DIR, "cytoBand_hg19.txt")
@@ -459,48 +494,85 @@ if (file.exists(CNVKIT_FILE)) {
     ))
 
     if (nrow(cnv_seg_data) > 0) {
-      # We map EVERY CNV segment (focal or large) to its exact cytoband
-      cnv_hits <- list()
+      cnv_seg_data <- cnv_seg_data %>%
+        left_join(tumor_fraction %>% select(Sample, Tumor_Fraction), by = "Sample")
 
-      for (j in seq_len(nrow(cnv_seg_data))) {
-        seg_j <- cnv_seg_data[j, ]
-
-        feature_name <- paste0(seg_j$Chromosome, " CNV") # Fallback
-
-        if (!is.null(cytobands)) {
-          midpoint <- seg_j$Start + (seg_j$End - seg_j$Start) / 2
-          band_hit <- cytobands %>%
-            filter(chrom == seg_j$Chromosome, start <= midpoint, end >= midpoint)
-
-          if (nrow(band_hit) > 0) {
-            clean_chr <- str_remove(seg_j$Chromosome, "^chr")
-            # Exact cytoband (e.g., "6q25.1", "2p16.1")
-            feature_name <- paste0(clean_chr, band_hit$name[1])
-          }
-        }
-
-        cnv_hits[[length(cnv_hits) + 1]] <- tibble(
-          Sample = seg_j$Sample,
-          Gene = feature_name, # Storing location replacing the 'Gene' row name
-          Log2_Ratio = seg_j$Log2_Ratio,
-          Copy_Number = seg_j$Copy_Number,
-          Call_Type = seg_j$Call_Type
-        )
-      }
-
-      cnv_seg_mapped <- bind_rows(cnv_hits) %>%
+      # High-confidence tier: preserve the prior behavior exactly by admitting only
+      # strict CNVkit Amplification/Deletion rows and mapping CN=0 deletions separately.
+      cnv_high_conf <- cnv_seg_data %>%
+        filter(Call_Type %in% c("Amplification", "Deletion")) %>%
         mutate(Mutation_Class = case_when(
           Call_Type == "Amplification" ~ "Amplification",
           Copy_Number == 0 ~ "Deep_Deletion",
           TRUE ~ "Deletion"
-        )) %>%
-        select(Sample, Gene, Mutation_Class) %>%
-        distinct()
+        ))
+
+      # Sensitive low-tumor-fraction tier: evaluate only SubThreshold segments from
+      # samples with an SNV-derived tumor fraction >=5%. The adaptive threshold is
+      # anchored to the expected single-copy gain/loss log2 shift at purity p, with a
+      # hard 0.1 log2 noise floor so very small estimated shifts do not create calls.
+      NOISE_FLOOR <- 0.1
+      cnv_sensitive <- cnv_seg_data %>%
+        filter(Call_Type == "SubThreshold", !is.na(Tumor_Fraction), Tumor_Fraction >= 0.05) %>%
+        mutate(
+          gain_shift = log2((2 + Tumor_Fraction) / 2),
+          loss_shift = abs(log2((2 - Tumor_Fraction) / 2)),
+          sens_gain = pmax(NOISE_FLOOR, 0.5 * gain_shift),
+          sens_loss = pmax(NOISE_FLOOR, 0.5 * loss_shift),
+          Mutation_Class = case_when(
+            Log2_Ratio >= sens_gain ~ "Amplification_LowTF",
+            Log2_Ratio <= -sens_loss ~ "Deletion_LowTF",
+            TRUE ~ NA_character_
+          )
+        ) %>%
+        filter(!is.na(Mutation_Class)) %>%
+        select(-gain_shift, -loss_shift, -sens_gain, -sens_loss)
+
+      n_sensitive_cnv <- nrow(cnv_sensitive)
+      cnv_seg_to_map <- bind_rows(cnv_high_conf, cnv_sensitive)
+
+      if (nrow(cnv_seg_to_map) > 0) {
+        # We map EVERY tiered CNV segment (focal or large) to its exact cytoband.
+        cnv_hits <- list()
+
+        for (j in seq_len(nrow(cnv_seg_to_map))) {
+          seg_j <- cnv_seg_to_map[j, ]
+
+          feature_name <- paste0(seg_j$Chromosome, " CNV") # Fallback
+
+          if (!is.null(cytobands)) {
+            midpoint <- seg_j$Start + (seg_j$End - seg_j$Start) / 2
+            band_hit <- cytobands %>%
+              filter(chrom == seg_j$Chromosome, start <= midpoint, end >= midpoint)
+
+            if (nrow(band_hit) > 0) {
+              clean_chr <- str_remove(seg_j$Chromosome, "^chr")
+              # Exact cytoband (e.g., "6q25.1", "2p16.1")
+              feature_name <- paste0(clean_chr, band_hit$name[1])
+            }
+          }
+
+          cnv_hits[[length(cnv_hits) + 1]] <- tibble(
+            Sample = seg_j$Sample,
+            Gene = feature_name, # Storing location replacing the 'Gene' row name
+            Log2_Ratio = seg_j$Log2_Ratio,
+            Copy_Number = seg_j$Copy_Number,
+            Call_Type = seg_j$Call_Type,
+            Mutation_Class = seg_j$Mutation_Class
+          )
+        }
+
+        cnv_seg_mapped <- bind_rows(cnv_hits) %>%
+          select(Sample, Gene, Mutation_Class) %>%
+          distinct()
+      }
 
       cat(sprintf("  Processed %d CNVs exactly to their locations.\n", nrow(cnv_seg_mapped)))
     }
   }
 }
+
+cat(sprintf("  Sensitive low tumor-fraction CNVs added: %d\n", n_sensitive_cnv))
 
 # The user explicitly requested to show ALL deletions and amplifications at their exact locations.
 # Therefore, we discard the gene-level definitions for CNVs and exclusively use the segment locations.
@@ -679,7 +751,9 @@ col <- c(
   "Inframe_Indel"    = "#993404", # Brown (cBioPortal standard)
   # CNV types (cBioPortal convention: red for amp, blue for del)
   "Amplification"    = "#FF0000", # Red (cBioPortal standard)
+  "Amplification_LowTF" = "#E79A9A", # Desaturated red for tumor-fraction-aware sensitive tier
   "Deletion"         = "#56B4E9", # Light Blue (heterozygous loss)
+  "Deletion_LowTF"   = "#9CC7E6", # Desaturated blue for tumor-fraction-aware sensitive tier
   "Deep_Deletion"    = "#0000FF", # Blue (cBioPortal standard for homozygous del)
   # Structural Variant types
   "SV_DEL"           = "#FDB462", # Light Orange
@@ -723,8 +797,14 @@ alter_fun <- list(
   "Amplification" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h - unit(0.5, "pt"), gp = gpar(fill = col["Amplification"], col = NA))
   },
+  "Amplification_LowTF" = function(x, y, w, h) {
+    grid.rect(x, y, w - unit(0.5, "pt"), h * 0.5, gp = gpar(fill = col["Amplification_LowTF"], col = NA))
+  },
   "Deletion" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h - unit(0.5, "pt"), gp = gpar(fill = col["Deletion"], col = NA))
+  },
+  "Deletion_LowTF" = function(x, y, w, h) {
+    grid.rect(x, y, w - unit(0.5, "pt"), h * 0.5, gp = gpar(fill = col["Deletion_LowTF"], col = NA))
   },
   "Deep_Deletion" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h - unit(0.5, "pt"), gp = gpar(fill = col["Deep_Deletion"], col = NA))
@@ -752,6 +832,8 @@ alter_fun_used <- alter_fun[c("background", names(col_used))]
 # Create human-readable legend labels
 legend_labels <- names(col_used) %>%
   str_replace("^aSHM_Variant$", "aSHM-associated (likely passenger)") %>%
+  str_replace("^Amplification_LowTF$", "Amplification (low tumor-fraction)") %>%
+  str_replace("^Deletion_LowTF$", "Deletion (low tumor-fraction)") %>%
   str_replace("_SNV", " (SNV)") %>%
   str_replace("_Indel", " (Indel)") %>%
   str_replace("Deep_Deletion", "Deep Deletion (CN=0)") %>%
