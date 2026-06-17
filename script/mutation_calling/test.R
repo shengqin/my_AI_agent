@@ -648,22 +648,40 @@ if (file.exists(CNVKIT_FILE)) {
       # samples with an SNV-derived tumor fraction >=5%. The adaptive threshold is
       # anchored to the expected single-copy gain/loss log2 shift at purity p, with a
       # hard 0.1 log2 noise floor so very small estimated shifts do not create calls.
+      #
+      # TIGHTENED (post-review) to reject the noise tail that the raw adaptive threshold
+      # admitted at low amplitude:
+      #   - SENS_MIN_BINS:   require stronger bintest evidence than the global >=1.
+      #   - SENS_MIN_MARGIN: log2 must clear the adaptive threshold by this margin (not just touch it).
+      #   - SENS_MAX_RECURRENCE: drop segments at identical (chr,start,end) across more than this many
+      #       samples — a systematic coverage/GC-artifact signature (e.g. a 12q24 segment recurring in
+      #       every high-coverage sample). NOTE: this is blunt and can also remove genuinely recurrent
+      #       lymphoma CNVs (e.g. 6q/6p losses); see the dropped-segment log below.
       NOISE_FLOOR <- 0.1
+      SENS_MIN_BINS <- 3L
+      SENS_MIN_MARGIN <- 0.03
+      SENS_MAX_RECURRENCE <- 2L
       cnv_sensitive <- cnv_seg_data %>%
         filter(Call_Type == "SubThreshold", !is.na(Tumor_Fraction), Tumor_Fraction >= 0.05) %>%
+        filter(N_Significant_Bins >= SENS_MIN_BINS) %>%
         mutate(
           gain_shift = log2((2 + Tumor_Fraction) / 2),
           loss_shift = abs(log2((2 - Tumor_Fraction) / 2)),
           sens_gain = pmax(NOISE_FLOOR, 0.5 * gain_shift),
           sens_loss = pmax(NOISE_FLOOR, 0.5 * loss_shift),
           Mutation_Class = case_when(
-            Log2_Ratio >= sens_gain ~ "Amplification_LowTF",
-            Log2_Ratio <= -sens_loss ~ "Deletion_LowTF",
+            Log2_Ratio >= sens_gain + SENS_MIN_MARGIN ~ "Amplification_LowTF",
+            Log2_Ratio <= -(sens_loss + SENS_MIN_MARGIN) ~ "Deletion_LowTF",
             TRUE ~ NA_character_
           )
         ) %>%
         filter(!is.na(Mutation_Class)) %>%
-        select(-gain_shift, -loss_shift, -sens_gain, -sens_loss)
+        # Drop segments recurring at identical coordinates across many samples (artifact signature).
+        group_by(Chromosome, Start, End) %>%
+        mutate(.recur_n = n_distinct(Sample)) %>%
+        ungroup() %>%
+        filter(.recur_n <= SENS_MAX_RECURRENCE) %>%
+        select(-gain_shift, -loss_shift, -sens_gain, -sens_loss, -.recur_n)
 
       n_sensitive_cnv <- nrow(cnv_sensitive)
       cnv_seg_to_map <- bind_rows(cnv_high_conf, cnv_sensitive)
