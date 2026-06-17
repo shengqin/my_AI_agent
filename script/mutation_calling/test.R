@@ -331,12 +331,13 @@ snv_qc <- snv_filt %>%
       TRUE ~ "Other_SNV"
     )
   ) %>%
-  # Flag aSHM-associated genes (kept but shown as a distinct likely-passenger category)
-  # and CHIP genes (kept but tagged for manual review).
+  # Compute aSHM/CHIP gene flags for INTERNAL use only (the PoN-recurrence bypass applied
+  # upstream, tumor-fraction exclusion, and CHIP review export). Per user request, aSHM
+  # variants are shown as ORDINARY mutations (their real SNV/indel class) in the OncoPrint —
+  # NO separate aSHM tag/category.
   mutate(
     Is_aSHM = Gene %in% ASHM_GENES,
-    Is_CHIP = Gene %in% CHIP_GENES,
-    Mutation_Class = ifelse(Is_aSHM, "aSHM_Variant", Mutation_Class)
+    Is_CHIP = Gene %in% CHIP_GENES
   )
 
 # Driver-gene near-threshold rescue: strictly limited to PASS, protein-altering,
@@ -402,10 +403,10 @@ cat(sprintf(
   nrow(snv_qc), n_distinct(snv_qc$Gene)
 ))
 cat(sprintf(
-  "    SNVs: %d | Indels: %d | aSHM-flagged: %d\n",
+  "    SNVs: %d | Indels: %d | aSHM-gene (shown as normal mutations): %d\n",
   sum(snv_qc$Mutation_Class %in% c("Missense_SNV", "Nonsense_SNV", "Splice_Site", "UTR_SNV", "Other_SNV")),
   sum(snv_qc$Mutation_Class %in% c("Frameshift_Indel", "Inframe_Indel")),
-  sum(snv_qc$Mutation_Class == "aSHM_Variant")
+  sum(snv_qc$Is_aSHM)
 ))
 
 # (4) Tag CHIP-gene calls and export them for manual adjudication. They remain in the
