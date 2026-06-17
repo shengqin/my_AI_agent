@@ -31,6 +31,20 @@ PON_SUMMARY_FILE <- file.path(RESULTS_DIR, "pon_site_summary.tsv")
 # Example: CosmicCodingMuts.vcf.gz (hg19/GRCh37)
 COSMIC_VCF <- file.path(DATA_DIR, "Cosmic_CompleteTargetedScreensMutant_v103_GRCh37.vcf.gz")
 
+# Aberrant somatic hypermutation (aSHM)-associated genes to FLAG as likely passengers and
+# show distinctly in the OncoPrint, rather than dropping them outright. Canonical drivers
+# (BCL2, BCL6, SOCS1, ...) are intentionally NOT in this list. Currently just IGLL5.
+ASHM_GENES <- c("IGLL5")
+
+# Clonal hematopoiesis (CHIP) genes. Because the matched normal is PBL (blood) and the
+# tumor input is plasma cfDNA, mutations in these genes may originate from clonal
+# hematopoiesis rather than lymphoma. They are KEPT but tagged for manual adjudication.
+CHIP_GENES <- c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53", "JAK2",
+                "SF3B1", "SRSF2", "GNB1", "CBL", "GNAS")
+
+# Ensure the output directory exists (for OncoPrint PDF, QC plots, and review CSVs below).
+dir.create(file.path(PROJECT_DIR, "analysis"), showWarnings = FALSE, recursive = TRUE)
+
 cat("Loading and processing variant data...\n")
 
 # ==============================================================================
@@ -42,8 +56,10 @@ snv_data <- read_tsv(MUTECT_FILE, col_types = cols(Tumor_F1R2 = col_character(),
 # QC Filter 1: Only keep high-confidence PASS variants
 snv_filt <- snv_data %>%
   filter(Filter == "PASS") %>%
-  # Remove known false positive / artifactual genes
-  filter(!Gene %in% c("ACTB", "IGLL5", "ABO", "MPEG1", "ELK2AP", "ELK2AP-MIR4507", "MIR8071-1-ELK2AP"))
+  # Remove known false-positive / mapping-artifact / pseudogene genes.
+  # NOTE: IGLL5 is intentionally NOT dropped here — it is a real aSHM target in B-cell
+  # lymphoma, so it is retained and flagged as likely-passenger below (see ASHM_GENES).
+  filter(!Gene %in% c("ACTB", "ABO", "MPEG1", "ELK2AP", "ELK2AP-MIR4507", "MIR8071-1-ELK2AP"))
 
 # QC Filter 2: Enforce the CAPP-Seq Published Strict Heuristics
 snv_filt <- snv_filt %>%
@@ -290,6 +306,13 @@ snv_qc <- snv_filt %>%
       Variant_Type == "5_prime_UTR_premature_start_codon_gain_variant" ~ "UTR_SNV",
       TRUE ~ "Other_SNV"
     )
+  ) %>%
+  # Flag aSHM-associated genes (kept but shown as a distinct likely-passenger category)
+  # and CHIP genes (kept but tagged for manual review).
+  mutate(
+    Is_aSHM = Gene %in% ASHM_GENES,
+    Is_CHIP = Gene %in% CHIP_GENES,
+    Mutation_Class = ifelse(Is_aSHM, "aSHM_Variant", Mutation_Class)
   )
 
 cat(sprintf(
@@ -297,10 +320,29 @@ cat(sprintf(
   nrow(snv_qc), n_distinct(snv_qc$Gene)
 ))
 cat(sprintf(
-  "    SNVs: %d | Indels: %d\n",
+  "    SNVs: %d | Indels: %d | aSHM-flagged: %d\n",
   sum(snv_qc$Mutation_Class %in% c("Missense_SNV", "Nonsense_SNV", "Splice_Site", "UTR_SNV", "Other_SNV")),
-  sum(snv_qc$Mutation_Class %in% c("Frameshift_Indel", "Inframe_Indel"))
+  sum(snv_qc$Mutation_Class %in% c("Frameshift_Indel", "Inframe_Indel")),
+  sum(snv_qc$Mutation_Class == "aSHM_Variant")
 ))
+
+# (4) Tag CHIP-gene calls and export them for manual adjudication. They remain in the
+# OncoPrint, but a plasma cfDNA mutation in these genes may be clonal hematopoiesis (blood)
+# rather than lymphoma — especially where it is also detectable in the matched PBL normal.
+chip_flagged <- snv_qc %>% filter(Is_CHIP)
+if (nrow(chip_flagged) > 0) {
+  CHIP_CSV <- file.path(PROJECT_DIR, "analysis", "chip_flagged_variants.csv")
+  chip_flagged %>%
+    select(any_of(c("Sample", "Gene", "Chromosome", "Position", "Ref", "Alt",
+                    "Variant_Type", "Mutation_Class", "Tumor_AF_num", "Normal_AF_num",
+                    "Tumor_DP", "Normal_DP", "Is_COSMIC", "COSMIC_ID"))) %>%
+    arrange(Gene, Sample) %>%
+    write_csv(CHIP_CSV)
+  cat(sprintf("  CHIP-gene calls flagged for manual review: %d (genes: %s) -> %s\n",
+              nrow(chip_flagged), paste(sort(unique(chip_flagged$Gene)), collapse = ", "), CHIP_CSV))
+} else {
+  cat("  CHIP-gene calls flagged for manual review: 0\n")
+}
 
 # ==============================================================================
 # 3. Read Segment-Level CNV Data and Map to Panel Genes
@@ -631,6 +673,7 @@ col <- c(
   "Splice_Site"      = "#9B59B6", # Purple
   "UTR_SNV"          = "#F39C12", # Gold/Amber
   "Other_SNV"        = "#7F8C8D", # Gray
+  "aSHM_Variant"     = "#85C1AE", # Teal — aSHM-associated, likely passenger (e.g. IGLL5)
   # Indel types
   "Frameshift_Indel" = "#2C3E50", # Dark Navy Blue (differentiated from Nonsense)
   "Inframe_Indel"    = "#993404", # Brown (cBioPortal standard)
@@ -664,6 +707,10 @@ alter_fun <- list(
   },
   "Other_SNV" = function(x, y, w, h) {
     grid.rect(x, y, w - unit(0.5, "pt"), h * 0.9, gp = gpar(fill = col["Other_SNV"], col = NA))
+  },
+  # aSHM-associated (likely passenger): half-height to visually denote lower confidence
+  "aSHM_Variant" = function(x, y, w, h) {
+    grid.rect(x, y, w - unit(0.5, "pt"), h * 0.5, gp = gpar(fill = col["aSHM_Variant"], col = NA))
   },
   # --- Indel types: slightly shorter (cBioPortal uses ~2/3 height for inframe) ---
   "Frameshift_Indel" = function(x, y, w, h) {
@@ -704,6 +751,7 @@ alter_fun_used <- alter_fun[c("background", names(col_used))]
 
 # Create human-readable legend labels
 legend_labels <- names(col_used) %>%
+  str_replace("^aSHM_Variant$", "aSHM-associated (likely passenger)") %>%
   str_replace("_SNV", " (SNV)") %>%
   str_replace("_Indel", " (Indel)") %>%
   str_replace("Deep_Deletion", "Deep Deletion (CN=0)") %>%
@@ -784,6 +832,32 @@ depth_data <- snv_data %>%
 # Strip "-T1" suffix to get clean patient IDs for labeling
 depth_data <- depth_data %>%
   mutate(Patient = str_remove(Sample, "-T1$"))
+
+# --- Callable-depth / effective-sensitivity report ---
+# The genotyping floor is governed by BOTH Tumor_AF >= 0.5% AND Tumor_AD_Alt >= 4, so the
+# minimum DETECTABLE VAF at a site is ~ 4 / Tumor_DP. Thus a 0.5% variant needs DP ~ 800 and
+# a 1% variant needs DP ~ 400. This table reports, per sample, the median depth, the implied
+# minimum detectable VAF at that median, and the fraction of sites reaching the 1% / 0.5%
+# depths. CAVEAT: computed over CALLED candidate sites in mutect2_variants.tsv — a proxy for
+# panel-wide coverage. True callable sensitivity needs per-base depth across the panel.
+callable_report <- depth_data %>%
+  group_by(Patient, Batch) %>%
+  summarize(
+    N_sites = n(),
+    Median_Tumor_DP = median(Tumor_DP_num),
+    Median_Normal_DP = median(Normal_DP_num),
+    Implied_min_VAF_at_median = round(4 / median(Tumor_DP_num), 4),
+    Frac_sites_DP_ge_400 = round(mean(Tumor_DP_num >= 400), 3), # ~1.0% LOD achievable
+    Frac_sites_DP_ge_800 = round(mean(Tumor_DP_num >= 800), 3), # ~0.5% LOD achievable
+    .groups = "drop"
+  ) %>%
+  arrange(Median_Tumor_DP)
+
+CALLABLE_CSV <- file.path(PROJECT_DIR, "analysis", "callable_depth_sensitivity.csv")
+write_csv(callable_report, CALLABLE_CSV)
+cat(sprintf("  Callable-depth/sensitivity report -> %s\n", CALLABLE_CSV))
+cat("  (Proxy over called sites; min detectable VAF ~= 4 / Tumor_DP given the AD_Alt>=4 floor.)\n")
+print(callable_report, n = Inf)
 
 pdf(QC_PDF, width = 14, height = 10)
 
