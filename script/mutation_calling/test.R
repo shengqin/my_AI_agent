@@ -85,6 +85,15 @@ overlaps_recurrent_locus <- function(chrom, start, end) {
         RECURRENT_CNV_LOCI$End >= start)
 }
 
+# Focal CNV loci kept as NAMED OncoPrint rows (not collapsed to chromosome arm), because the
+# specific locus carries Hodgkin/GCB-lymphoma meaning (CD274/PD-L1, REL, MYC). Editable.
+FOCAL_CNV_LOCI <- tibble::tribble(
+  ~Chromosome, ~Start,      ~End,       ~Label,
+  "chr9",        4900000,    5600000,   "9p24.1 (CD274/JAK2)",
+  "chr2",       60500000,   63500000,   "2p16.1 (REL)",
+  "chr8",      128000000,  129500000,   "8q24 (MYC)"
+)
+
 # Ensure the output directory exists (for OncoPrint PDF, QC plots, and review CSVs below).
 dir.create(file.path(PROJECT_DIR, "analysis"), showWarnings = FALSE, recursive = TRUE)
 
@@ -693,9 +702,11 @@ if (file.exists(CNVKIT_FILE)) {
           loss_shift = abs(log2((2 - Tumor_Fraction) / 2)),
           sens_gain = pmax(NOISE_FLOOR, 0.5 * gain_shift),
           sens_loss = pmax(NOISE_FLOOR, 0.5 * loss_shift),
+          # Per user request, sensitive-tier CNVs are shown as ORDINARY Amplification/Deletion
+          # (no separate low-tumor-fraction tag), merging with the high-confidence tier.
           Mutation_Class = case_when(
-            Log2_Ratio >= sens_gain + SENS_MIN_MARGIN ~ "Amplification_LowTF",
-            Log2_Ratio <= -(sens_loss + SENS_MIN_MARGIN) ~ "Deletion_LowTF",
+            Log2_Ratio >= sens_gain + SENS_MIN_MARGIN ~ "Amplification",
+            Log2_Ratio <= -(sens_loss + SENS_MIN_MARGIN) ~ "Deletion",
             TRUE ~ NA_character_
           )
         ) %>%
@@ -722,19 +733,25 @@ if (file.exists(CNVKIT_FILE)) {
         for (j in seq_len(nrow(cnv_seg_to_map))) {
           seg_j <- cnv_seg_to_map[j, ]
 
-          feature_name <- paste0(seg_j$Chromosome, " CNV") # Fallback
+          clean_chr <- str_remove(seg_j$Chromosome, "^chr")
+          feature_name <- paste0(clean_chr, " CNV") # Fallback
 
+          # Default: collapse to the chromosome ARM (e.g. "6p"/"6q") so the OncoPrint isn't
+          # fragmented into many adjacent sub-band rows (6p21.1, 6p22.1, 6p22.2, ...).
           if (!is.null(cytobands)) {
             midpoint <- seg_j$Start + (seg_j$End - seg_j$Start) / 2
             band_hit <- cytobands %>%
               filter(chrom == seg_j$Chromosome, start <= midpoint, end >= midpoint)
-
             if (nrow(band_hit) > 0) {
-              clean_chr <- str_remove(seg_j$Chromosome, "^chr")
-              # Exact cytoband (e.g., "6q25.1", "2p16.1")
-              feature_name <- paste0(clean_chr, band_hit$name[1])
+              arm <- substr(band_hit$name[1], 1, 1) # "p" or "q"
+              feature_name <- paste0(clean_chr, arm) # e.g. "6p"
             }
           }
+
+          # Exception: keep signature focal loci as their own named rows (not arm-collapsed).
+          foc <- FOCAL_CNV_LOCI %>%
+            filter(Chromosome == seg_j$Chromosome, Start <= seg_j$End, End >= seg_j$Start)
+          if (nrow(foc) > 0) feature_name <- foc$Label[1]
 
           cnv_hits[[length(cnv_hits) + 1]] <- tibble(
             Sample = seg_j$Sample,
