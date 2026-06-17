@@ -20,6 +20,7 @@ MUTECT_FILE <- file.path(RESULTS_DIR, "mutect2_variants.tsv")
 CNVKIT_FILE <- file.path(RESULTS_DIR, "cnvkit_aberrations.tsv")
 CNV_GENE_FILE <- file.path(RESULTS_DIR, "cnvkit_gene_cnvs.tsv")
 SV_FILE <- file.path(RESULTS_DIR, "manta_somatic_svs.tsv")
+COHORT_VARIANT_SUMMARY_FILE <- file.path(RESULTS_DIR, "cohort_variant_summary.csv")
 OUTPUT_PDF <- file.path(PROJECT_DIR, "analysis", "cohort_oncoprint.pdf")
 
 # PoN frequency summary from build_mutect2_pon.sh (set to NA to skip PoN filtering)
@@ -70,6 +71,29 @@ cat("Loading and processing variant data...\n")
 # ==============================================================================
 # Read data
 snv_data <- read_tsv(MUTECT_FILE, col_types = cols(Tumor_F1R2 = col_character(), Tumor_F2R1 = col_character(), Tumor_AF = col_character(), Normal_AF = col_character(), Tumor_AD_Alt = col_character(), Tumor_AD_Ref = col_character()), show_col_types = FALSE)
+
+sample_ids_from_file <- function(file, reader) {
+  if (!file.exists(file)) return(character(0))
+  tryCatch({
+    dat <- reader(file)
+    if ("Sample" %in% colnames(dat)) as.character(dat$Sample) else character(0)
+  }, error = function(e) character(0))
+}
+
+sample_ids_from_object_or_file <- function(object_name, file, reader) {
+  if (exists(object_name)) {
+    dat <- get(object_name)
+    if ("Sample" %in% colnames(dat)) return(as.character(dat$Sample))
+  }
+  sample_ids_from_file(file, reader)
+}
+
+all_cohort_samples <- sort(unique(na.omit(c(
+  as.character(snv_data$Sample),
+  sample_ids_from_object_or_file("cnv_seg_data", CNVKIT_FILE, function(x) read_tsv(x, show_col_types = FALSE)),
+  sample_ids_from_object_or_file("sv_data", SV_FILE, function(x) read_tsv(x, show_col_types = FALSE)),
+  sample_ids_from_file(COHORT_VARIANT_SUMMARY_FILE, function(x) read_csv(x, show_col_types = FALSE))
+))))
 
 # QC Filter 1: Only keep high-confidence PASS variants
 snv_filt <- snv_data %>%
@@ -216,6 +240,7 @@ if (!is.na(COSMIC_VCF) && file.exists(COSMIC_VCF)) {
     cosmic_df <- cosmic_df %>%
       rename(Chromosome = X1, Position = X2, COSMIC_ID = X3, Ref = X4, Alt = X5) %>%
       mutate(Position = as.numeric(Position)) %>%
+      separate_rows(Alt, sep = ",") %>%
       # Normalize chromosome naming to match the pipeline's hg19 "chr"-prefixed contigs.
       # COSMIC GRCh37 VCFs use "1"/"MT" (no "chr"); without this the join silently matches
       # NOTHING and the COSMIC rescue becomes a no-op.
@@ -380,6 +405,16 @@ if (exists("pon_data")) {
     filter(Fraction_PON_Samples < 0.10)
 }
 
+if (all(c("Tumor_F1R2", "Tumor_F2R1") %in% colnames(snv_rescue))) {
+  snv_rescue <- snv_rescue %>%
+    mutate(
+      F1R2_Alt = as.numeric(sapply(strsplit(as.character(Tumor_F1R2), ","), function(x) if(length(x)>1) x[2] else "0")),
+      F2R1_Alt = as.numeric(sapply(strsplit(as.character(Tumor_F2R1), ","), function(x) if(length(x)>1) x[2] else "0")),
+      Is_Indel = (nchar(Ref) != nchar(Alt)) | nchar(Ref) > 1 | nchar(Alt) > 1
+    ) %>%
+    filter(!Is_Indel | (F1R2_Alt > 0 & F2R1_Alt > 0))
+}
+
 snv_rescue <- snv_rescue %>%
   anti_join(snv_qc, by = c("Sample", "Chromosome", "Position", "Ref", "Alt")) %>%
   mutate(
@@ -462,8 +497,8 @@ tumor_fraction_counts <- snv_filt %>%
     .groups = "drop"
   )
 
-# Sample universe = every sample in the input, so all samples appear (NA where < 3 SNVs).
-tumor_fraction <- tibble(Sample = sort(unique(snv_data$Sample))) %>%
+# Sample universe = every sample seen in SNV, CNV, SV, or cohort summary inputs.
+tumor_fraction <- tibble(Sample = all_cohort_samples) %>%
   left_join(tumor_fraction_counts, by = "Sample") %>%
   mutate(
     N_SNV_for_TF = replace_na(N_SNV_for_TF, 0L),
@@ -564,11 +599,12 @@ if (file.exists(CNVKIT_FILE)) {
     cnv_seg_data <- cnv_seg_data %>%
       filter(Probes >= 5)
 
-    # 3. Stricter threshold for arm-level events: large segments (>10Mb) require
-    #    abs(log2) > 0.5 to reduce noise from GC bias and coverage unevenness
+    # 3. Stricter threshold for arm-level events: large non-SubThreshold segments
+    #    (>10Mb) require abs(log2) > 0.5; SubThreshold rows remain eligible for
+    #    the tumor-fraction-aware sensitive tier below.
     cnv_seg_data <- cnv_seg_data %>%
       mutate(Seg_Size = End - Start) %>%
-      filter(!(Seg_Size > 10e6 & abs(Log2_Ratio) < 0.5)) %>%
+      filter(!(Call_Type != "SubThreshold" & Seg_Size > 10e6 & abs(Log2_Ratio) < 0.5)) %>%
       select(-Seg_Size)
 
     # 4. Bintest evidence filter: require >= 1 bin inside the segment to have
@@ -724,18 +760,28 @@ if (file.exists(SV_FILE)) {
       sv_pos   <- as.numeric(sv$Position)
       mate_pos <- as.numeric(sv$Mate_Pos)
       mate_chr <- if ("Mate_Chrom" %in% colnames(sv_data)) sv$Mate_Chrom else NA_character_
+      sv_type  <- as.character(sv$SV_Type)
+      # Effective mate chromosome for focal mapping: fall back to the event chromosome when
+      # the mate chromosome is unknown ("." / NA) — e.g. Manta INV/BND records that encode the
+      # partner via END rather than CHR2 — so the mate breakpoint still maps to real genes.
+      mate_chr_eff <- if (is.na(mate_chr) || mate_chr == ".") sv$Chromosome else mate_chr
 
-      if (!is.na(mate_chr) && mate_chr != "." && mate_chr != sv$Chromosome) {
-        # Interchromosomal (BND / translocation): map EACH breakpoint on its OWN
-        # chromosome with a focal window — do NOT span the gap across chromosomes
-        # (which would both miss the partner gene and create false hits on chr1).
+      if ((!is.na(mate_chr) && mate_chr != "." && mate_chr != sv$Chromosome) ||
+          sv_type %in% c("BND", "INV")) {
+        # Breakpoint events (including same-chromosome BND/INV) map EACH breakpoint
+        # focally; do NOT span the interval.
         hit_genes <- unique(c(
           genes_near(sv$Chromosome, sv_pos,  sv_pos),
-          genes_near(mate_chr,      mate_pos, mate_pos)
+          genes_near(mate_chr_eff,  mate_pos, mate_pos)
         ))
-      } else {
-        # Intrachromosomal (DEL/DUP/INV): map genes across the spanned region.
+      } else if (sv_type %in% c("DEL", "DUP")) {
+        # Intrachromosomal DEL/DUP: map genes across the spanned region.
         hit_genes <- genes_near(sv$Chromosome, sv_pos, mate_pos)
+      } else {
+        hit_genes <- unique(c(
+          genes_near(sv$Chromosome, sv_pos,  sv_pos),
+          genes_near(mate_chr_eff,  mate_pos, mate_pos)
+        ))
       }
 
       if (length(hit_genes) > 0) {
@@ -820,7 +866,7 @@ onco_mat_plot <- rbind(
 )
 
 # Add cohort samples with no post-QC alterations as empty OncoPrint columns.
-cohort_samples <- sort(unique(str_remove(snv_data$Sample, "-T1$")))
+cohort_samples <- sort(unique(str_remove(all_cohort_samples, "-T1$")))
 missing_cohort_samples <- setdiff(cohort_samples, colnames(onco_mat_plot))
 if (length(missing_cohort_samples) > 0) {
   plot_rownames <- rownames(onco_mat_plot)
