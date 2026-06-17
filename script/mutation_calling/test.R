@@ -61,6 +61,30 @@ DRIVER_GENES <- c("SGK1", "DUSP2", "JUNB", "SOCS1", "NFKBIE", "STAT6", "GNA13",
                   "TP53", "NOTCH1", "NOTCH2", "SPEN", "HIST1H1E", "GNA13",
                   "MYD88", "CD79B", "PIM1")
 
+# Canonical recurrent CNV loci in Hodgkin / germinal-center B-cell lymphoma (hg19, broad windows).
+# Sensitive-tier segments overlapping these are EXEMPT from the cross-sample recurrence-drop, so
+# genuinely recurrent disease CNVs survive even when they recur, while non-canonical recurrent
+# segments (e.g. the 12q24 coverage artifact) are still filtered. Editable.
+RECURRENT_CNV_LOCI <- tibble::tribble(
+  ~Chromosome, ~Start,     ~End,        ~Locus,
+  "chr9",        4900000,    5600000,   "9p24.1 (JAK2/CD274/PDCD1LG2)",
+  "chr2",       60500000,   63500000,   "2p16.1 (REL/BCL11A)",
+  "chr6",       90000000,  171000000,   "6q (PRDM1/TNFAIP3)",
+  "chr6",       25000000,   35000000,   "6p21 (MHC/HLA)",
+  "chr17",             1,   10000000,   "17p (TP53)",
+  "chr3",      186000000,  189000000,   "3q27 (BCL6)",
+  "chr15",      44900000,   45100000,   "15q21 (B2M)",
+  "chr16",      10800000,   11100000,   "16p13 (CIITA)",
+  "chr1",              1,   12000000,   "1p36"
+)
+
+# TRUE if a segment [start,end] on `chrom` overlaps any canonical recurrent CNV locus.
+overlaps_recurrent_locus <- function(chrom, start, end) {
+  any(RECURRENT_CNV_LOCI$Chromosome == chrom &
+        RECURRENT_CNV_LOCI$Start <= end &
+        RECURRENT_CNV_LOCI$End >= start)
+}
+
 # Ensure the output directory exists (for OncoPrint PDF, QC plots, and review CSVs below).
 dir.create(file.path(PROJECT_DIR, "analysis"), showWarnings = FALSE, recursive = TRUE)
 
@@ -676,12 +700,17 @@ if (file.exists(CNVKIT_FILE)) {
           )
         ) %>%
         filter(!is.na(Mutation_Class)) %>%
-        # Drop segments recurring at identical coordinates across many samples (artifact signature).
+        # Drop segments recurring at identical coordinates across many samples (artifact signature),
+        # UNLESS they overlap a canonical recurrent lymphoma CNV locus (RECURRENT_CNV_LOCI), which are
+        # expected to recur for biological reasons (e.g. 6q/TNFAIP3, 9p24/CD274, 6p21/HLA).
         group_by(Chromosome, Start, End) %>%
         mutate(.recur_n = n_distinct(Sample)) %>%
         ungroup() %>%
-        filter(.recur_n <= SENS_MAX_RECURRENCE) %>%
-        select(-gain_shift, -loss_shift, -sens_gain, -sens_loss, -.recur_n)
+        rowwise() %>%
+        mutate(.whitelisted = overlaps_recurrent_locus(Chromosome, Start, End)) %>%
+        ungroup() %>%
+        filter(.recur_n <= SENS_MAX_RECURRENCE | .whitelisted) %>%
+        select(-gain_shift, -loss_shift, -sens_gain, -sens_loss, -.recur_n, -.whitelisted)
 
       n_sensitive_cnv <- nrow(cnv_sensitive)
       cnv_seg_to_map <- bind_rows(cnv_high_conf, cnv_sensitive)
