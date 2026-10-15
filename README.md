@@ -1,85 +1,117 @@
-# cfDNA-PBMC Somatic Mutation Calling Pipeline
+# Liquid Biopsy & Tumor RNA-seq Pipelines
 
-This repository contains a high-confidence bioinformatics pipeline designed for calling somatic variants from paired cell-free DNA (cfDNA) and matched normal peripheral blood mononuclear cell (PBMC) samples. 
+HPC pipelines for **cell-free DNA (cfDNA) somatic variant calling** and **tumor-microbiome profiling from RNA-seq**, developed for Hodgkin lymphoma translational studies at Stanford University (Radiation Oncology).
 
-The pipeline is rigorously optimized to meet the **CAPP-Seq** (Cancer Personalized Profiling by deep Sequencing) publication standards for detecting ultra-low frequency variants (≤1% VAF), while minimizing false positives derived from sequencing and PCR artifacts.
+| Pipeline | Input | What it produces |
+|---|---|---|
+| [`script/mutation_calling/`](script/mutation_calling) | Plasma cfDNA + matched PBMC BAMs (hybrid capture) | SNVs, indels, copy-number changes, structural variants, tumor fraction, cohort OncoPrint |
+| [`script/taxonomic/pipeline/`](script/taxonomic/pipeline) | Trimmed RNA-seq FASTQs (FFPE tumors) | High-confidence microbial taxa with QC accounting at every filter |
 
----
-
-## 🧬 Pipeline Architecture
-
-The workflow integrates standard state-of-the-art tools, enhanced with custom artifact suppression modeling:
-
-1. **SNV & Indel Calling (GATK Mutect2)**
-   - Utilizes a **Panel of Normals (PoN)** to filter out recurrent germline artifacts and systematic sequencing errors.
-   - Leverages **Read Orientation Modeling** (`LearnReadOrientationModel`) to eliminate strand-bias artifacts like 8-oxoguanine oxidation errors, critical for low-VAF cfDNA calling.
-   - Restricts calling to the targeted capture regions via BED files to optimize runtime.
-
-2. **Copy Number Variation (CNVkit)**
-   - Operates in hybrid-capture mode utilizing a pooled normal reference baseline for stable copy number calculations.
-   - Generates segment-level integer copy numbers and explicitly calculates statistical p-values using the binomial test (`cnvkit.py bintest`).
-
-3. **Structural Variants (Manta)**
-   - Executes somatic structural variant calling using matched tumor/normal pairs.
-
-4. **Rigorous Filtering (R & CAPP-Seq Heuristics)**
-   - Applies strict depth, VAF, and standard subtraction criteria against matched normal samples.
-   - Validates multi-strand support for indels (`F1R2` and `F2R1` read parsing) to ensure true biological signal over PCR artifacts.
-   - Cross-references COSMIC for biological rescue logic based on PoN frequencies.
+Both pipelines run on SLURM (Stanford Sherlock), are restartable, and log every read or variant they drop.
 
 ---
 
-## 📂 Directory Structure
+## 1. cfDNA somatic variant calling
+
+A tumor–normal pipeline for low-allele-fraction variants in plasma, built around published CAPP-Seq filtering heuristics.
+
+### Workflow
 
 ```
-├── README.md
-└── script/
-    └── mutation_calling/
-        ├── run_full_pipeline.sh               # Master SLURM orchestrator
-        ├── build_cnvkit_reference.sh          # Generates pooled normal CNV reference
-        ├── build_mutect2_pon.sh               # Generates Mutect2 Panel of Normals (PoN)
-        ├── mutation_calling_from_bam.sh       # Main per-sample calling script (SNVs, CNVs, SVs)
-        ├── summarize_variant_calls.sh         # Aggregates VCF/CNS outputs into tidy TSV formats
-        └── test.R                             # R script for final CAPP-Seq statistical filtering
+ Matched PBMC BAMs ──► Mutect2 Panel of Normals  ─┐
+                  └──► CNVkit pooled reference  ─┤      (built once per cohort)
+                                                 ▼
+ cfDNA + PBMC BAMs ──► per-sample SLURM array
+                        ├─ Mutect2 (tumor–normal, PoN, 0.1% AF floor)
+                        │    └─ LearnReadOrientationModel → FilterMutectCalls
+                        ├─ bcftools norm → snpEff (canonical transcripts)
+                        ├─ CNVkit (hybrid) → call → bintest → genemetrics
+                        └─ Manta (somatic SVs)
+                                                 ▼
+                       cohort summarizer → tidy TSVs
+                                                 ▼
+                 R filtering + reporting (CAPP-Seq heuristics)
 ```
 
-> Note: All raw data, intermediate BAM files, VCFs, and PDF analysis outputs are explicitly ignored by Git to keep the repository lightweight.
+### Filtering and reporting (R stage)
+- Depth, alt-read support, and VAF thresholds, with strict limits on allele fraction in the matched normal
+- Strand support for indels (F1R2 and F2R1) and a homopolymer/STR slippage filter
+- Panel-of-normals frequency filter for recurrent background noise
+- COSMIC-based rescue of known drivers near the detection threshold
+- **CHIP genes flagged** and excluded from tumor-fraction estimates, so clonal hematopoiesis isn't called as tumor
+- Tumor fraction estimated from confident SNVs, with tumor-fraction-aware CNV calls
+- Cohort **OncoPrint** of SNVs, indels, CNVs, and SVs (ComplexHeatmap)
 
----
-
-## 🚀 Usage Guide
-
-The pipeline is orchestrated to run on the **Stanford Sherlock HPC cluster** using the SLURM workload manager.
-
-### 1. Configuration
-Edit the configuration section at the top of `script/mutation_calling/run_full_pipeline.sh` to define your input batches, reference genome paths, target BED files, and directories.
-
-### 2. Execution
-Run the master orchestrator. It will automatically handle dependencies and submit jobs in the correct order:
-1. Builds the CNVkit pooled reference
-2. Builds the Mutect2 PoN
-3. Executes per-sample variant calling arrays
-4. Summarizes all cohort results
+### Run
 
 ```bash
 cd script/mutation_calling
-bash run_full_pipeline.sh
+# 1. Edit the configuration block at the top of run_full_pipeline.sh
+#    (batches, normals, target BED, reference genome, output directories)
+bash run_full_pipeline.sh                      # build references + call + summarize
+SKIP_PON_BUILD=true bash run_full_pipeline.sh  # reuse existing PoN / CNV reference
+
+# 2. Filter, estimate tumor fraction, and plot
+Rscript test.R
+
+# Optional: re-call CNVs with per-sample purity
+bash recall_cnvkit_with_purity.sh
 ```
 
-### 3. Final Filtering & OncoPrint Generation
-Once the summary jobs complete, run the R script to apply final CAPP-Seq heuristics and visualize the results.
+The orchestrator submits jobs with SLURM dependencies: (1) CNVkit reference and (2) Mutect2 PoN in parallel, then (3) per-sample calling arrays, then (4) the cohort summary. Each step checks for complete outputs and skips them, so you can safely re-run.
 
-```bash
-Rscript script/mutation_calling/test.R
-```
+### Key scripts
+
+| Script | Purpose |
+|---|---|
+| `run_full_pipeline.sh` | Single-command SLURM orchestrator |
+| `build_mutect2_pon.sh` | Mutect2 Panel of Normals from matched normals |
+| `build_cnvkit_reference.sh` | Pooled-normal CNVkit reference |
+| `mutation_calling_from_bam.sh` | Per-sample SNV/indel, CNV, and SV calling |
+| `summarize_variant_calls.sh` | Flattens per-sample VCF/CNVkit/Manta outputs into cohort TSVs |
+| `test.R` | CAPP-Seq-style filtering, tumor fraction, OncoPrint |
+| `recall_cnvkit_with_purity.sh` | Optional purity-aware CNV re-calling |
+| `build_panel_gene_coords.py` | Gene spans for the capture panel (UCSC refGene) for SV-to-gene mapping |
+
+### Requirements
+SLURM · GATK 4.6 · Manta 1.6 · CNVkit · snpEff · bcftools / samtools · R (tidyverse, ComplexHeatmap, circlize) · Python 3
 
 ---
 
-## ⚙️ Requirements
-- SLURM Workload Manager
-- Conda Environments: `cnvkit`, `snpeff`
-- GATK4 (v4.6.0.0+)
-- Samtools (v1.16.1+)
-- bcftools (v1.16+)
-- Python 2.7 (for Manta) / Python 3.x (for CNVkit)
-- R (with `dplyr`, `tidyr`, `ComplexHeatmap` packages)
+## 2. Tumor-microbiome profiling from RNA-seq
+
+Detects and quantifies microbial reads in an FFPE tumor RNA-seq cohort. It runs **two independent classifiers (Kraken2/Bracken and Kaiju)** and keeps only taxa they agree on, after host, contamination, and abundance filters.
+
+- Host removal (STAR, host rRNA, low-complexity, and duplicate filters)
+- Kraken2 → Bracken and Kaiju → kaiju2table in parallel
+- Cross-validation by NCBI taxid or genus-aware name matching
+- Kitome/contaminant blocklist, minimizer, abundance, prevalence, and concordance filters
+- Full accounting: `QC_read_accounting.csv`, `filter_funnel_summary.csv`, and `rejected_calls.csv.gz`, where every rejected call carries its reason
+
+See [`script/taxonomic/pipeline/README.md`](script/taxonomic/pipeline/README.md) for the full workflow diagram and run instructions.
+
+---
+
+## Repository layout
+
+```
+script/
+├── mutation_calling/      # cfDNA somatic pipeline (see above)
+├── taxonomic/pipeline/    # tumor-microbiome pipeline (own README)
+├── cnv_calling_from_bam.sh   # earlier standalone CNVkit workflow (superseded by mutation_calling/)
+├── cHL.R                  # exploratory cohort analysis of SNV calls
+├── debug.R                # scratch
+└── ConsensusExomePipelineHuman.sh   # third-party reference (see note)
+```
+
+Raw data, BAMs, VCFs, and figures are excluded by `.gitignore`. **No patient data is stored in this repository.**
+
+**Note on attribution:** `ConsensusExomePipelineHuman.sh` is a colleague's exome consensus-calling pipeline, kept here for reference only. I did not write it.
+
+**Paths:** scripts reference Stanford Sherlock storage (`/oak/...`). Edit the configuration blocks to run them elsewhere.
+
+---
+
+## Author
+**Shengqin (Brian) Su, PhD**, Research Scientist, Stanford University
+[shengqin.github.io](https://shengqin.github.io) · [LinkedIn](https://www.linkedin.com/in/shengqinsu/)
